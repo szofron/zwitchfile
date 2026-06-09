@@ -5,7 +5,7 @@
 
 // What source extensions can produce what targets.
 export const CONVERSION_MATRIX = Object.freeze({
-    pdf:   ["jpg", "png", "webp", "txt"],
+    pdf:   ["docx", "jpg", "png", "webp", "txt"],
     docx:  ["html", "txt", "pdf"],
     xlsx:  ["csv", "json", "html"],
     xls:   ["csv", "json", "html"],
@@ -180,6 +180,113 @@ async function pdfToImages(file, targetExt) {
 
     if (blobs.length === 1) return blobs[0].blob;
     return zipBlobs(blobs);
+}
+
+/**
+ * Group pdf.js text items into visual lines by their Y coordinate, sorted L→R.
+ * Returns [{ y, text }] sorted top-to-bottom (PDF Y axis grows upward).
+ */
+function groupItemsIntoLines(items, yTolerance = 2.5) {
+    if (!items || items.length === 0) return [];
+    // pdf.js exposes transform [a,b,c,d,e,f]; e = x, f = y in PDF coords.
+    const enriched = items
+        .filter((it) => typeof it.str === "string")
+        .map((it) => ({
+            text: it.str,
+            x: it.transform[4],
+            y: it.transform[5],
+            width: it.width || 0,
+            hasEOL: !!it.hasEOL,
+        }));
+    if (enriched.length === 0) return [];
+
+    // Cluster by Y (tolerance-based bucketing, descending Y = top of page first).
+    enriched.sort((a, b) => b.y - a.y);
+    const lines = [];
+    let current = null;
+    for (const item of enriched) {
+        if (!current || Math.abs(current.y - item.y) > yTolerance) {
+            current = { y: item.y, items: [item] };
+            lines.push(current);
+        } else {
+            current.items.push(item);
+        }
+    }
+
+    return lines.map((line) => {
+        line.items.sort((a, b) => a.x - b.x);
+        // Re-introduce spaces where horizontal gaps suggest a word break.
+        let out = "";
+        let prevEnd = null;
+        const avgChar = line.items.reduce((sum, it) =>
+            sum + (it.width / Math.max(it.text.length, 1)), 0) / line.items.length || 4;
+        for (const it of line.items) {
+            if (prevEnd !== null) {
+                const gap = it.x - prevEnd;
+                if (gap > avgChar * 0.6 && !out.endsWith(" ")) out += " ";
+            }
+            out += it.text;
+            prevEnd = it.x + it.width;
+        }
+        return { y: line.y, text: out.trim() };
+    }).filter((l) => l.text.length > 0);
+}
+
+/** Convert a PDF into an editable .docx via text extraction. */
+async function pdfToDocx(file) {
+    if (!window.docx) {
+        throw new Error("ไลบรารี docx ยังไม่โหลด — กรุณารีเฟรชหน้าเว็บ");
+    }
+    const pdfjsLib = await loadPdfJs();
+    const buffer = await readAsArrayBuffer(file);
+    const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+
+    const { Document, Packer, Paragraph, TextRun, PageBreak, HeadingLevel } = window.docx;
+
+    const children = [];
+    let totalChars = 0;
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        const lines = groupItemsIntoLines(content.items);
+
+        for (const line of lines) {
+            totalChars += line.text.length;
+            children.push(new Paragraph({
+                children: [new TextRun({ text: line.text })],
+            }));
+        }
+
+        // Page break between pages (but not after the last).
+        if (i < pdf.numPages) {
+            children.push(new Paragraph({
+                children: [new PageBreak()],
+            }));
+        }
+    }
+
+    if (totalChars === 0) {
+        // No extractable text — likely scanned. Tell the user clearly.
+        throw new Error(
+            "PDF นี้ไม่มีข้อความที่ดึงออกมาได้ (อาจเป็น PDF สแกน) — " +
+            "ลองแปลงเป็น JPG/PNG แทน หรือใช้เครื่องมือ OCR แยก"
+        );
+    }
+
+    const docDef = new Document({
+        creator: "zwitchfile",
+        title: file.name,
+        sections: [{
+            properties: {},
+            children,
+        }],
+    });
+
+    const blob = await Packer.toBlob(docDef);
+    return new Blob([blob], {
+        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
 }
 
 /** Extract all text from a PDF and return as a text Blob. */
@@ -508,6 +615,7 @@ export async function convertFile(file, sourceExt, targetExt) {
         else throw new Error("ไม่รองรับการแปลงนี้");
     } else if (src === "pdf") {
         if (dst === "txt") blob = await pdfToText(file);
+        else if (dst === "docx") blob = await pdfToDocx(file);
         else if (["jpg", "png", "webp"].includes(dst)) {
             blob = await pdfToImages(file, dst);
             if (blob.type === "application/zip") outExt = "zip";

@@ -10,7 +10,7 @@
 
 | Source         | Targets                       |
 | -------------- | ----------------------------- |
-| PDF            | JPG, PNG, WebP, TXT           |
+| PDF            | DOCX, JPG, PNG, WebP, TXT     |
 | Word (.docx)   | HTML, TXT, PDF                |
 | Excel (.xlsx)  | CSV, JSON, HTML               |
 | Excel (.xls)   | CSV, JSON, HTML               |
