@@ -244,8 +244,111 @@ const SIZE_LATIN = 28;    // 14pt
 const LINE_SPACING_1_5 = 360;  // 1.5x in 240ths
 const PARA_SPACE_AFTER = 120;  // 6pt
 
-/** Convert a PDF into an editable .docx with Thai-friendly typography. */
+/**
+ * Convert a PDF into a Word document where every page is a pixel-perfect
+ * reproduction of the source PDF page.
+ *
+ * Strategy: render each PDF page to a PNG, embed it inside a Word section
+ * whose page size matches the PDF page (margins zeroed) so printing the docx
+ * yields output identical to the original PDF.
+ */
 async function pdfToDocx(file) {
+    if (!window.docx) {
+        throw new Error("ไลบรารี docx ยังไม่โหลด — กรุณารีเฟรชหน้าเว็บ");
+    }
+    const pdfjsLib = await loadPdfJs();
+    const buffer = await readAsArrayBuffer(file);
+    const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+
+    const {
+        Document, Packer, Paragraph, ImageRun, LineRuleType,
+    } = window.docx;
+
+    // 2x scale → crisp image even when Word renders at the native page size.
+    const RENDER_SCALE = 2;
+
+    const sections = [];
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+
+        // Render page → canvas → PNG bytes
+        const viewport = page.getViewport({ scale: RENDER_SCALE });
+        const canvas = document.createElement("canvas");
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#FFFFFF";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        await page.render({ canvasContext: ctx, viewport }).promise;
+        const pngBlob = await canvasToBlob(canvas, "image/png");
+        const pngBytes = new Uint8Array(await pngBlob.arrayBuffer());
+
+        // PDF page dimensions in points (1pt = 1/72 inch)
+        const ptViewport = page.getViewport({ scale: 1 });
+        const widthPt = ptViewport.width;
+        const heightPt = ptViewport.height;
+
+        // Word page size uses twips (1pt = 20 twips)
+        const widthTwips = Math.round(widthPt * 20);
+        const heightTwips = Math.round(heightPt * 20);
+
+        // ImageRun transformation uses pixels at 96 DPI (1pt = 96/72 = 4/3 px)
+        const imgWidthPx = Math.round(widthPt * 96 / 72);
+        const imgHeightPx = Math.round(heightPt * 96 / 72);
+
+        sections.push({
+            properties: {
+                page: {
+                    size: { width: widthTwips, height: heightTwips },
+                    margin: {
+                        top: 0, right: 0, bottom: 0, left: 0,
+                        header: 0, footer: 0, gutter: 0,
+                    },
+                },
+            },
+            children: [
+                new Paragraph({
+                    spacing: {
+                        before: 0, after: 0,
+                        line: 240, lineRule: LineRuleType.AUTO,
+                    },
+                    indent: { left: 0, right: 0, firstLine: 0 },
+                    children: [
+                        new ImageRun({
+                            data: pngBytes,
+                            transformation: {
+                                width: imgWidthPx,
+                                height: imgHeightPx,
+                            },
+                        }),
+                    ],
+                }),
+            ],
+        });
+    }
+
+    if (sections.length === 0) {
+        throw new Error("PDF นี้ไม่มีหน้าที่แสดงผลได้");
+    }
+
+    const docDef = new Document({
+        creator: "zwitchfile",
+        title: file.name,
+        description: "PDF rendered as visual-fidelity Word document",
+        sections,
+    });
+
+    const blob = await Packer.toBlob(docDef);
+    return new Blob([blob], {
+        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+}
+
+// === Legacy text-only PDF → DOCX (kept for reference, exposed via TXT now) ===
+// Renamed to pdfToDocxText if we want to re-introduce as separate option later.
+// eslint-disable-next-line no-unused-vars
+async function _pdfToDocxTextOnly(file) {
     if (!window.docx) {
         throw new Error("ไลบรารี docx ยังไม่โหลด — กรุณารีเฟรชหน้าเว็บ");
     }
