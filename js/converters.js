@@ -284,8 +284,8 @@ async function pdfToDocx(file) {
         const children = [new Paragraph({ children: [] })];
 
         for (const item of content.items) {
-            const text = (item.str || "").replace(/ /g, "");
-            if (!text) continue;
+            const text = item.str || "";
+            if (!text.trim()) continue;
             totalItems++;
 
             // pdf.js item.transform = [a, b, c, d, e, f]
