@@ -245,12 +245,14 @@ const LINE_SPACING_1_5 = 360;  // 1.5x in 240ths
 const PARA_SPACE_AFTER = 120;  // 6pt
 
 /**
- * Convert a PDF into a Word document where every page is a pixel-perfect
- * reproduction of the source PDF page.
+ * Convert PDF → Word while preserving the visual layout.
  *
- * Strategy: render each PDF page to a PNG, embed it inside a Word section
- * whose page size matches the PDF page (margins zeroed) so printing the docx
- * yields output identical to the original PDF.
+ * Strategy: keep each PDF page's dimensions, then place every text fragment
+ * inside a frame-anchored paragraph at its exact (x, y) coordinates with its
+ * original font size. Page-relative anchoring means the text falls on the
+ * same spot of the page as in the PDF, and remains editable in Word.
+ *
+ * Thai fragments are rendered in Sarabun; Latin in Helvetica (auto fallback).
  */
 async function pdfToDocx(file) {
     if (!window.docx) {
@@ -261,81 +263,119 @@ async function pdfToDocx(file) {
     const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
 
     const {
-        Document, Packer, Paragraph, ImageRun, LineRuleType,
+        Document, Packer, Paragraph, TextRun,
+        FrameAnchorType, LineRuleType,
     } = window.docx;
 
-    // 2x scale → crisp image even when Word renders at the native page size.
-    const RENDER_SCALE = 2;
+    const PT_TO_TWIPS = 20;       // 1pt = 20 twips
+    const THAI_REGEX = /[฀-๿]/;
 
     const sections = [];
+    let totalItems = 0;
 
     for (let i = 1; i <= pdf.numPages; i++) {
         const page = await pdf.getPage(i);
+        const vp = page.getViewport({ scale: 1 });   // PDF coords in points
+        const pageWPt = vp.width;
+        const pageHPt = vp.height;
+        const content = await page.getTextContent();
 
-        // Render page → canvas → PNG bytes
-        const viewport = page.getViewport({ scale: RENDER_SCALE });
-        const canvas = document.createElement("canvas");
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        const ctx = canvas.getContext("2d");
-        ctx.fillStyle = "#FFFFFF";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        await page.render({ canvasContext: ctx, viewport }).promise;
-        const pngBlob = await canvasToBlob(canvas, "image/png");
-        const pngBytes = new Uint8Array(await pngBlob.arrayBuffer());
+        // Section starts with an empty anchor paragraph (frames attach to it).
+        const children = [new Paragraph({ children: [] })];
 
-        // PDF page dimensions in points (1pt = 1/72 inch)
-        const ptViewport = page.getViewport({ scale: 1 });
-        const widthPt = ptViewport.width;
-        const heightPt = ptViewport.height;
+        for (const item of content.items) {
+            const text = (item.str || "").replace(/ /g, "");
+            if (!text) continue;
+            totalItems++;
 
-        // Word page size uses twips (1pt = 20 twips)
-        const widthTwips = Math.round(widthPt * 20);
-        const heightTwips = Math.round(heightPt * 20);
+            // pdf.js item.transform = [a, b, c, d, e, f]
+            const [a, b, , , e, f] = item.transform;
+            const fontPt = Math.hypot(a, b) || 12;
+            const widthPt = item.width || (text.length * fontPt * 0.55);
+            const heightPt = fontPt * 1.3;
 
-        // ImageRun transformation uses pixels at 96 DPI (1pt = 96/72 = 4/3 px)
-        const imgWidthPx = Math.round(widthPt * 96 / 72);
-        const imgHeightPx = Math.round(heightPt * 96 / 72);
+            // Convert PDF coords (origin bottom-left) → Word page coords (top-left).
+            const xPt = e;
+            const yPt = pageHPt - f;                  // baseline → distance from top
+            const yTopPt = Math.max(0, yPt - fontPt); // top edge of glyph box
+
+            const hasThai = THAI_REGEX.test(text);
+            const fontFamily = hasThai ? "Sarabun" : "Helvetica";
+            const sizeHalfPt = Math.round(fontPt * 2); // docx uses half-points
+
+            children.push(new Paragraph({
+                frame: {
+                    type: "absolute",
+                    position: {
+                        x: Math.round(xPt * PT_TO_TWIPS),
+                        y: Math.round(yTopPt * PT_TO_TWIPS),
+                    },
+                    width:  Math.round((widthPt + 2) * PT_TO_TWIPS),
+                    height: Math.round(heightPt * PT_TO_TWIPS),
+                    anchor: {
+                        horizontal: FrameAnchorType.PAGE,
+                        vertical:   FrameAnchorType.PAGE,
+                    },
+                },
+                spacing: {
+                    before: 0,
+                    after: 0,
+                    line: 240,
+                    lineRule: LineRuleType.AUTO,
+                },
+                indent: { left: 0, right: 0, firstLine: 0 },
+                children: [new TextRun({
+                    text,
+                    font: {
+                        ascii: fontFamily,
+                        cs:    "Sarabun",
+                        hAnsi: fontFamily,
+                    },
+                    size: sizeHalfPt,
+                })],
+            }));
+        }
 
         sections.push({
             properties: {
                 page: {
-                    size: { width: widthTwips, height: heightTwips },
+                    size: {
+                        width:  Math.round(pageWPt * PT_TO_TWIPS),
+                        height: Math.round(pageHPt * PT_TO_TWIPS),
+                    },
                     margin: {
                         top: 0, right: 0, bottom: 0, left: 0,
                         header: 0, footer: 0, gutter: 0,
                     },
                 },
             },
-            children: [
-                new Paragraph({
-                    spacing: {
-                        before: 0, after: 0,
-                        line: 240, lineRule: LineRuleType.AUTO,
-                    },
-                    indent: { left: 0, right: 0, firstLine: 0 },
-                    children: [
-                        new ImageRun({
-                            data: pngBytes,
-                            transformation: {
-                                width: imgWidthPx,
-                                height: imgHeightPx,
-                            },
-                        }),
-                    ],
-                }),
-            ],
+            children,
         });
     }
 
-    if (sections.length === 0) {
-        throw new Error("PDF นี้ไม่มีหน้าที่แสดงผลได้");
+    if (totalItems === 0) {
+        throw new Error(
+            "PDF นี้ไม่มีข้อความที่ดึงออกมาได้ (อาจเป็น PDF สแกน) — " +
+            "ลองแปลงเป็น JPG/PNG เพื่อเก็บภาพ หรือใช้เครื่องมือ OCR แยก"
+        );
     }
 
     const docDef = new Document({
         creator: "zwitchfile",
         title: file.name,
-        description: "PDF rendered as visual-fidelity Word document",
+        description: "PDF text laid out with original positions",
+        styles: {
+            default: {
+                document: {
+                    run: {
+                        font: {
+                            ascii: "Sarabun", cs: "Sarabun",
+                            hAnsi: "Sarabun", eastAsia: "Sarabun",
+                        },
+                    },
+                },
+            },
+        },
         sections,
     });
 
