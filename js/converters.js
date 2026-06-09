@@ -225,13 +225,20 @@ async function docxToPdf(file) {
 
 /** Render an HTML string into a PDF using jsPDF's html() method. */
 async function htmlStringToPdf(html) {
+    if (typeof window.html2canvas !== "function") {
+        throw new Error("ไลบรารี html2canvas ยังไม่โหลด — กรุณารีเฟรชหน้าเว็บ");
+    }
     const { jsPDF } = window.jspdf;
-    const pdf = new jsPDF({ unit: "pt", format: "a4" });
+    const pdf = new jsPDF({ unit: "pt", format: "a4", compress: true });
+
     const container = document.createElement("div");
     container.style.cssText =
-        "width:540px;font-family:system-ui,'Noto Sans Thai',sans-serif;font-size:11pt;line-height:1.5;color:#1F1B2E;padding:8px;";
+        "width:540px;font-family:'Noto Sans Thai','Sarabun',system-ui,-apple-system,sans-serif;" +
+        "font-size:11pt;line-height:1.55;color:#1F1B2E;padding:8px;background:#FFFFFF;" +
+        "word-wrap:break-word;overflow-wrap:break-word;";
     container.innerHTML = html;
-    // Need the node attached so html2canvas (used by jsPDF.html) can measure it.
+
+    // The node must be attached and visible for html2canvas to measure layout.
     container.style.position = "fixed";
     container.style.left = "-10000px";
     container.style.top = "0";
@@ -244,7 +251,16 @@ async function htmlStringToPdf(html) {
             width: 540,
             windowWidth: 540,
             autoPaging: "text",
+            html2canvas: {
+                scale: 0.75,
+                useCORS: true,
+                logging: false,
+                backgroundColor: "#FFFFFF",
+            },
         });
+    } catch (err) {
+        // Re-throw with clearer Thai message.
+        throw new Error("แปลงเป็น PDF ไม่สำเร็จ: " + (err && err.message ? err.message : err));
     } finally {
         document.body.removeChild(container);
     }
