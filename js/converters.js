@@ -215,7 +215,12 @@ function groupItemsIntoLines(items, yTolerance = 2.5) {
 
     return lines.map((line) => {
         line.items.sort((a, b) => a.x - b.x);
-        // Re-introduce spaces where horizontal gaps suggest a word break.
+        const joined = line.items.map((it) => it.text).join("");
+        const thaiCount = (joined.match(/[฀-๿]/g) || []).length;
+        const isMostlyThai = joined.length > 0 && thaiCount / joined.length > 0.3;
+        // Thai has no inter-word spaces, so require a much bigger gap to insert one.
+        const gapMultiplier = isMostlyThai ? 1.5 : 0.6;
+
         let out = "";
         let prevEnd = null;
         const avgChar = line.items.reduce((sum, it) =>
@@ -223,16 +228,23 @@ function groupItemsIntoLines(items, yTolerance = 2.5) {
         for (const it of line.items) {
             if (prevEnd !== null) {
                 const gap = it.x - prevEnd;
-                if (gap > avgChar * 0.6 && !out.endsWith(" ")) out += " ";
+                if (gap > avgChar * gapMultiplier && !out.endsWith(" ")) out += " ";
             }
             out += it.text;
             prevEnd = it.x + it.width;
         }
-        return { y: line.y, text: out.trim() };
+        return { y: line.y, text: out.trim(), hasThai: thaiCount > 0 };
     }).filter((l) => l.text.length > 0);
 }
 
-/** Convert a PDF into an editable .docx via text extraction. */
+// Thai-aware typography defaults for the docx output.
+const DOCX_FONT = "Sarabun";
+const SIZE_THAI = 32;     // 16pt (docx uses half-points)
+const SIZE_LATIN = 28;    // 14pt
+const LINE_SPACING_1_5 = 360;  // 1.5x in 240ths
+const PARA_SPACE_AFTER = 120;  // 6pt
+
+/** Convert a PDF into an editable .docx with Thai-friendly typography. */
 async function pdfToDocx(file) {
     if (!window.docx) {
         throw new Error("ไลบรารี docx ยังไม่โหลด — กรุณารีเฟรชหน้าเว็บ");
@@ -241,7 +253,33 @@ async function pdfToDocx(file) {
     const buffer = await readAsArrayBuffer(file);
     const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
 
-    const { Document, Packer, Paragraph, TextRun, PageBreak, HeadingLevel } = window.docx;
+    const {
+        Document, Packer, Paragraph, TextRun, PageBreak,
+        AlignmentType, LineRuleType, convertInchesToTwip,
+    } = window.docx;
+
+    /** Build a styled TextRun for one extracted line. */
+    const runFor = (text, hasThai) => new TextRun({
+        text,
+        font: {
+            ascii: DOCX_FONT,
+            cs:    DOCX_FONT,
+            hAnsi: DOCX_FONT,
+            eastAsia: DOCX_FONT,
+        },
+        size: hasThai ? SIZE_THAI : SIZE_LATIN,
+    });
+
+    /** Build a paragraph with Thai-friendly spacing. */
+    const paraFor = (line) => new Paragraph({
+        alignment: AlignmentType.JUSTIFIED,
+        spacing: {
+            line: LINE_SPACING_1_5,
+            lineRule: LineRuleType.AUTO,
+            after: PARA_SPACE_AFTER,
+        },
+        children: [runFor(line.text, line.hasThai)],
+    });
 
     const children = [];
     let totalChars = 0;
@@ -253,9 +291,7 @@ async function pdfToDocx(file) {
 
         for (const line of lines) {
             totalChars += line.text.length;
-            children.push(new Paragraph({
-                children: [new TextRun({ text: line.text })],
-            }));
+            children.push(paraFor(line));
         }
 
         // Page break between pages (but not after the last).
@@ -267,7 +303,6 @@ async function pdfToDocx(file) {
     }
 
     if (totalChars === 0) {
-        // No extractable text — likely scanned. Tell the user clearly.
         throw new Error(
             "PDF นี้ไม่มีข้อความที่ดึงออกมาได้ (อาจเป็น PDF สแกน) — " +
             "ลองแปลงเป็น JPG/PNG แทน หรือใช้เครื่องมือ OCR แยก"
@@ -277,8 +312,40 @@ async function pdfToDocx(file) {
     const docDef = new Document({
         creator: "zwitchfile",
         title: file.name,
+        // Document-wide defaults so any user-added paragraphs also pick up Sarabun.
+        styles: {
+            default: {
+                document: {
+                    run: {
+                        font: {
+                            ascii: DOCX_FONT,
+                            cs: DOCX_FONT,
+                            hAnsi: DOCX_FONT,
+                            eastAsia: DOCX_FONT,
+                        },
+                        size: SIZE_THAI,
+                    },
+                    paragraph: {
+                        spacing: {
+                            line: LINE_SPACING_1_5,
+                            lineRule: LineRuleType.AUTO,
+                            after: PARA_SPACE_AFTER,
+                        },
+                    },
+                },
+            },
+        },
         sections: [{
-            properties: {},
+            properties: {
+                page: {
+                    margin: {
+                        top:    convertInchesToTwip(1),
+                        bottom: convertInchesToTwip(1),
+                        left:   convertInchesToTwip(1),
+                        right:  convertInchesToTwip(1),
+                    },
+                },
+            },
             children,
         }],
     });
