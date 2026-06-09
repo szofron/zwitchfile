@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="th">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>zwitchfile · Browser File Converter</title>
+    <meta name="description" content="Convert files entirely in your browser. PDF, Word, Excel, images. No upload, no server." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%233730A3'/%3E%3Ctext x='32' y='44' font-size='34' text-anchor='middle' fill='%23FAF6EC' font-family='system-ui' font-weight='700'%3Ez%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">
+            <span class="logo-mark" aria-hidden="true">
+                <svg viewBox="0 0 40 40" width="32" height="32">
+                    <rect x="2" y="2" width="36" height="36" rx="10" fill="#3730A3" />
+                    <path d="M14 14 L26 14 L14 26 L26 26" stroke="#FAF6EC" stroke-width="3"
+                          fill="none" stroke-linecap="round" stroke-linejoin="round" />
+                    <circle cx="30" cy="13" r="2" fill="#7C2D3F" />
+                </svg>
+            </span>
+            <div class="brand-text">
+                <strong>zwitchfile</strong>
+                <small>Convert in your browser · nothing leaves your device</small>
+            </div>
+        </div>
+        <nav class="topnav">
+            <button type="button" class="ghost-btn" id="about-btn">About</button>
+            <a class="ghost-btn" href="https://github.com" target="_blank" rel="noopener">GitHub</a>
+        </nav>
+    </header>
+
+    <main class="layout">
+        <section class="card hero-card">
+            <div class="hero">
+                <h1>แปลงไฟล์ในเบราว์เซอร์ <span class="accent">ไม่ต้องอัปโหลด</span></h1>
+                <p class="lede">เลือกไฟล์ของคุณ — ทุกการแปลงเกิดขึ้นบนเครื่องคุณเอง รวดเร็ว ปลอดภัย ส่วนตัว</p>
+            </div>
+
+            <div id="drop-zone" class="drop-zone" tabindex="0">
+                <div class="drop-art" id="drop-art">
+                    <!-- mascot rendered by JS -->
+                </div>
+                <p class="drop-title">ลากไฟล์มาวางตรงนี้</p>
+                <p class="drop-sub">หรือ</p>
+                <button type="button" id="browse-btn" class="primary-btn">เลือกไฟล์</button>
+                <input id="file-input" type="file" hidden />
+                <p class="hint">รองรับ PDF · Word · Excel · CSV · TXT · JPG · PNG · WebP · BMP · GIF</p>
+            </div>
+        </section>
+
+        <section class="card detail-card hidden" id="detail-card">
+            <div class="file-row">
+                <div class="file-mascot" id="file-mascot"></div>
+                <div class="file-info">
+                    <div class="file-name" id="file-name">filename.ext</div>
+                    <div class="file-sub" id="file-sub">— KB</div>
+                </div>
+                <button type="button" class="ghost-btn" id="clear-btn">เปลี่ยนไฟล์</button>
+            </div>
+
+            <div class="control-grid">
+                <div class="control">
+                    <label for="target-format">แปลงเป็น</label>
+                    <select id="target-format" disabled>
+                        <option value="">เลือกรูปแบบ…</option>
+                    </select>
+                </div>
+                <div class="control control-action">
+                    <button type="button" class="primary-btn wide-btn" id="convert-btn" disabled>
+                        <span>เริ่มแปลง</span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="progress-wrap" class="progress-wrap hidden">
+                <div class="progress-label" id="progress-label">กำลังแปลง…</div>
+                <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+            </div>
+        </section>
+
+        <section class="card preview-card hidden" id="preview-card">
+            <h2>ตัวอย่างไฟล์</h2>
+            <div id="preview-area" class="preview-area">
+                <div class="preview-placeholder">ยังไม่มีไฟล์ที่จะแสดงตัวอย่าง</div>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <span>© zwitchfile · Static site · ทำงาน 100% ใน browser ของคุณ</span>
+    </footer>
+
+    <!-- Beautiful modal -->
+    <div class="modal-backdrop hidden" id="modal-backdrop" role="dialog" aria-modal="true">
+        <div class="modal-card" id="modal-card">
+            <div class="modal-art" id="modal-art"></div>
+            <h3 class="modal-title" id="modal-title">หัวเรื่อง</h3>
+            <p class="modal-body" id="modal-body">เนื้อหา</p>
+            <div class="modal-actions" id="modal-actions">
+                <button type="button" class="primary-btn" id="modal-primary">ตกลง</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- third-party libs (CDN) -->
+    <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.6.82/build/pdf.min.mjs" type="module" id="pdfjs-loader"></script>
+    <script>
+        // Resolve the worker URL for pdf.js so it works on GitHub Pages.
+        window.__PDFJS_WORKER_SRC = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.6.82/build/pdf.worker.min.mjs";
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mammoth@1.8.0/mammoth.browser.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+
+    <script src="js/mascots.js"></script>
+    <script type="module" src="js/converters.js"></script>
+    <script type="module" src="js/app.js"></script>
+</body>
+</html>
