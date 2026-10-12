@@ -1,0 +1,678 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>แผนที่นำทางในอาคาร</title>
+<meta name="description" content="ต้นแบบระบบแผนที่นำทางในอาคารโรงพยาบาลแบบ 3 มิติ — แผนผังจำลองเพื่อการสาธิต">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<style>
+/* Layout: full-bleed isometric floor plan; a left control rail (bottom sheet on phones); floor switcher + SOS on the right. Single light look (wayfinding signage). */
+:root{
+  color-scheme:light;
+  --bg:#e8eff0; --card:#ffffff; --ink:#1b2a36; --muted:#5d6f7f; --line:#dde6ea; --soft:#f2f7f8;
+  --route:#0e93a8; --route-d:#0a6f80; --route-l:#ddf2f5;
+  --start:#2563eb; --dest:#d63d74; --exit:#15803d; --exit-l:#e2f5e8; --sos:#c62828; --sos-l:#fdeaea;
+  --shadow:0 8px 26px rgba(25,55,70,.14),0 1px 3px rgba(25,55,70,.08);
+  --font:'Noto Sans Thai','Sarabun','Leelawadee UI',Tahoma,system-ui,sans-serif;
+  --r:14px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--ink);font-family:var(--font);font-size:14px;line-height:1.45}
+button,input,select{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:3px solid var(--route);outline-offset:2px}
+#stage{position:fixed;inset:0}
+#stage canvas{display:block}
+.css2d{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+
+.panel{position:fixed;left:12px;top:12px;bottom:12px;width:372px;display:flex;flex-direction:column;gap:10px;z-index:10;pointer-events:none}
+.card{background:var(--card);border-radius:var(--r);box-shadow:var(--shadow);padding:12px 14px;pointer-events:auto}
+.head{display:flex;gap:10px;align-items:center}
+.logo{width:36px;height:36px;border-radius:10px;background:var(--route);display:grid;place-items:center;flex:none}
+.head h1{margin:0;font-size:17px;line-height:1.2;text-wrap:balance}
+.head small{color:var(--muted);font-size:12px}
+.lbl-s{font-size:11.5px;letter-spacing:.04em;color:var(--muted);font-weight:600;margin:0 0 5px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+select,input[type=search]{border:1px solid #c9d7de;border-radius:10px;background:#fff;padding:7px 10px;min-width:0}
+input[type=search]{width:100%;font-size:15px}
+.btn{border:0;border-radius:10px;background:var(--route);color:#fff;font-weight:600;padding:7px 14px}
+.btn:hover{background:var(--route-d)}
+.btn.ghost{background:var(--soft);color:var(--ink)}
+.btn.ghost:hover,.btn.ghost[aria-pressed="true"]{background:var(--route-l);color:var(--route-d)}
+.chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.chip{border:1px solid var(--line);background:var(--soft);border-radius:999px;padding:3px 11px;font-size:12.5px}
+.chip[aria-pressed="true"]{background:var(--route);border-color:var(--route);color:#fff}
+.search{display:flex;flex-direction:column;min-height:0;flex:1 1 auto}
+.results{list-style:none;margin:8px 0 0;padding:0;overflow:auto;min-height:0;flex:1 1 auto;scrollbar-width:thin}
+.results li button{width:100%;display:grid;grid-template-columns:12px 1fr auto;gap:9px;align-items:center;text-align:left;background:none;border:0;border-radius:9px;padding:7px 6px}
+.results li button:hover,.results li button[aria-current="true"]{background:var(--route-l)}
+.results .dot{width:12px;height:12px;border-radius:4px;border:1px solid rgba(0,0,0,.12)}
+.results .fl{font-size:12px;color:var(--muted);white-space:nowrap}
+.results .en{display:block;font-size:11.5px;color:var(--muted)}
+.empty{color:var(--muted);font-size:13px;padding:8px 4px}
+
+.route{display:flex;flex-direction:column;min-height:0;flex:1 1 auto}
+.sum{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:6px 0 8px}
+.sum div{background:var(--soft);border-radius:10px;padding:6px 8px}
+.sum b{display:block;font-size:19px;font-variant-numeric:tabular-nums;line-height:1.15}
+.sum span{font-size:11.5px;color:var(--muted)}
+.dest-name{font-size:16px;font-weight:700;margin:0;text-wrap:balance}
+.steps{list-style:none;margin:0;padding:0;overflow:auto;min-height:0;flex:1 1 auto;scrollbar-width:thin}
+.steps li{display:grid;grid-template-columns:30px 1fr;gap:8px;padding:7px 4px;border-top:1px solid var(--line);cursor:pointer;border-radius:8px}
+.steps li:hover{background:var(--soft)}
+.steps .ic{width:30px;height:30px;border-radius:9px;background:var(--route-l);color:var(--route-d);display:grid;place-items:center;font-weight:700;font-size:16px}
+.steps .ic.v{background:#eae6fb;color:#5b3fc4}
+.steps .ic.end{background:#fbe3ec;color:var(--dest)}
+.steps .ic.exit{background:var(--exit-l);color:var(--exit)}
+.steps small{display:block;color:var(--muted);font-size:12px}
+.opt{display:flex;align-items:center;gap:8px;font-size:13px;margin:2px 0 6px}
+.opt input{width:18px;height:18px;accent-color:var(--route)}
+.warn{background:var(--sos-l);color:var(--sos);border-radius:10px;padding:7px 10px;font-weight:600;font-size:13px;margin-bottom:6px}
+.note{font-size:12px;color:var(--muted)}
+
+.floors{position:fixed;right:14px;top:56px;display:flex;flex-direction:column;gap:6px;z-index:10}
+.floors button{width:64px;height:54px;border-radius:12px;border:0;background:var(--card);box-shadow:var(--shadow);font-weight:700;font-size:15px;position:relative;line-height:1.1}
+.floors button small{display:block;font-size:10.5px;font-weight:500;color:var(--muted)}
+.floors button[aria-pressed="true"]{background:var(--route);color:#fff}
+.floors button[aria-pressed="true"] small{color:#e2f7fa}
+.floors button .has{position:absolute;top:5px;right:6px;width:9px;height:9px;border-radius:50%;background:var(--dest);border:2px solid #fff}
+.sos{position:fixed;right:14px;bottom:14px;z-index:10;border:0;border-radius:14px;background:var(--sos);color:#fff;font-weight:700;padding:12px 16px;box-shadow:var(--shadow)}
+.sos:hover{filter:brightness(1.08)}
+#badge{position:fixed;top:10px;right:14px;z-index:20;background:#fff7d6;color:#6f5000;border:1.5px solid #f0c23a;border-radius:999px;padding:4px 12px;font-weight:600;font-size:12.5px;box-shadow:var(--shadow);white-space:nowrap}
+.legend{position:fixed;right:14px;bottom:72px;z-index:10;font-size:12px;padding:9px 12px;display:grid;gap:4px}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:4px;margin-right:6px;vertical-align:-2px;border:1px solid rgba(0,0,0,.12)}
+.legend .ln{display:inline-block;width:18px;height:5px;border-radius:3px;background:var(--route);margin-right:6px;vertical-align:2px}
+.toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);z-index:30;background:var(--ink);color:#fff;border-radius:12px;padding:8px 14px;font-size:13.5px;box-shadow:var(--shadow)}
+[hidden]{display:none!important}
+
+/* 3D labels */
+.rl{background:rgba(255,255,255,.92);border:1px solid #cfe0e6;border-radius:8px;padding:1px 7px;font-size:11.5px;font-weight:600;white-space:nowrap;box-shadow:0 2px 8px rgba(25,55,70,.14);display:flex;align-items:center;gap:5px}
+.rl i{width:8px;height:8px;border-radius:3px;display:inline-block}
+.rl.small{font-size:10.5px;font-weight:500;padding:0 5px}
+.rl.exit{background:var(--exit);color:#fff;border-color:var(--exit)}
+.rl.dest{background:var(--dest);color:#fff;border-color:var(--dest);font-size:13px;padding:3px 10px}
+.rl.start{background:var(--start);color:#fff;border-color:var(--start);font-size:13px;padding:3px 10px}
+.rl.kiosk{background:#fff;color:var(--start);border-color:#bcd0f7;font-size:10.5px}
+.rl.compass{background:none;border:0;box-shadow:none;font-size:15px;font-weight:700;color:var(--muted)}
+
+/* kiosk mode: larger type, no start picker */
+.kiosk-mode{font-size:16px}
+.kiosk-mode .panel{width:440px}
+.kiosk-mode .head h1{font-size:21px}
+.kiosk-mode input[type=search]{font-size:18px;padding:10px 12px}
+.kiosk-mode .results li button{padding:10px 8px;font-size:16px}
+
+@media (max-width:760px){
+  .panel{left:0;right:0;top:auto;bottom:0;width:auto;max-height:52%;gap:0}
+  .panel>.card{border-radius:18px 18px 0 0;box-shadow:0 -6px 22px rgba(25,55,70,.16)}
+  .panel>.card+.card{border-radius:0;box-shadow:none;border-top:1px solid var(--line)}
+  .panel .head{display:none}
+  .panel{padding-bottom:env(safe-area-inset-bottom,0px)}
+  .floors{top:48px;right:10px}
+  .floors button{width:56px;height:46px}
+  .sos{top:48px;bottom:auto;left:10px;right:auto;padding:9px 12px;font-size:13px}
+  .legend{display:none}
+  #badge{left:10px;right:10px;text-align:center;font-size:11.5px;white-space:normal}
+  .card{padding:10px 14px}
+}
+@media (prefers-reduced-motion: reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="badge" role="note">แผนผังจำลองเพื่อการสาธิต — ไม่ใช่ผังจริงของโรงพยาบาล</div>
+
+<aside class="panel" aria-label="ค้นหาและนำทาง">
+  <div class="card">
+    <div class="head">
+      <div class="logo" aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 2C8 2 5 5.1 5 9c0 5.2 7 13 7 13s7-7.8 7-13c0-3.9-3-7-7-7z" fill="#fff"/><circle cx="12" cy="9" r="2.6" fill="#0e93a8"/></svg></div>
+      <div><h1>แผนที่นำทางในอาคาร</h1><small>ต้นแบบ Indoor Map · นำร่องชั้น 1 อาคารหลัก</small></div>
+    </div>
+    <div style="margin-top:10px" id="startBox">
+      <p class="lbl-s">จุดเริ่มต้น</p>
+      <div class="row">
+        <select id="start" style="flex:1" aria-label="จุดเริ่มต้น"></select>
+        <button class="btn ghost" id="pickStart" aria-pressed="false" title="แตะบนแผนที่เพื่อกำหนดจุดเริ่มต้น">เลือกบนแผนที่</button>
+      </div>
+    </div>
+    <div id="kioskHere" class="note" hidden></div>
+  </div>
+
+  <div class="card search" id="searchCard">
+    <p class="lbl-s">ต้องการไปที่ไหน</p>
+    <input type="search" id="q" placeholder="ค้นหา เช่น รับยา, ห้องน้ำ, ศูนย์หัวใจ" autocomplete="off" aria-label="ค้นหาปลายทาง">
+    <div class="chips" id="chips" role="group" aria-label="หมวดหมู่"></div>
+    <ul class="results" id="results"></ul>
+  </div>
+
+  <div class="card route" id="routeCard" hidden>
+    <div class="row" style="justify-content:space-between;align-items:flex-start;flex-wrap:nowrap">
+      <div style="min-width:0"><p class="lbl-s" id="routeKind">เส้นทางไป</p><p class="dest-name" id="destName"></p></div>
+      <button class="btn ghost" id="clear">ล้าง</button>
+    </div>
+    <div class="warn" id="sosWarn" hidden>ห้ามใช้ลิฟต์ขณะเกิดเหตุเพลิงไหม้ ใช้บันไดหนีไฟและเดินตามป้ายทางออกสีเขียว</div>
+    <div class="sum"><div><b id="sDist">–</b><span>ระยะทาง</span></div><div><b id="sTime">–</b><span>เวลาโดยประมาณ</span></div><div><b id="sFloors">–</b><span>ชั้น</span></div></div>
+    <label class="opt"><input type="checkbox" id="accessible"> ไม่ใช้บันได (รถเข็น / ผู้สูงอายุ / รถเข็นเด็ก)</label>
+    <ol class="steps" id="steps"></ol>
+    <p class="note" id="routeNote"></p>
+  </div>
+</aside>
+
+<div class="floors" id="floors" role="group" aria-label="เลือกชั้น"></div>
+<div class="card legend" id="legend" aria-label="คำอธิบายสี"></div>
+<button class="sos" id="sos">ทางหนีไฟที่ใกล้ที่สุด</button>
+<div class="toast" id="toast" hidden></div>
+
+<script type="module">
+/*
+ * แผนที่นำทางในอาคาร — DEMO (single file, no build step)
+ * ============================================================================
+ * ASSUMPTIONS
+ *  - The floor plan is a PLACEHOLDER (2 floors, main building). It is not the real hospital layout.
+ *    Room names follow the proposal (ศูนย์หัวใจ ศูนย์ไต ศูนย์ถันย์ ศูนย์เต้านม NKC, ...); positions are invented.
+ *  - Routing is computed on a corridor graph (Dijkstra). Positioning (BLE / UWB) is out of scope:
+ *    the start point is a kiosk, or a point the user taps on the map.
+ *  - Walking speed 1.2 m/s, wheelchair 0.8 m/s, lift wait 45 s, stairs 25 s per floor (CONFIG).
+ *  - Emergency mode never uses lifts and only ends at ground-floor exits.
+ *  - Kiosk mode: ?kiosk=K1 (or #K1). Start is locked and the route resets after CONFIG.idleResetSec idle.
+ * ============================================================================
+ */
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+// ===== 1. CONFIG =====
+const CONFIG = {
+  speed: { walk: 1.2, wheelchair: 0.8 },          // m/s
+  lift: { waitSec: 45, costM: 35 },               // routing cost in "metre equivalents"
+  stairs: { secPerFloor: 25, costM: 18 },
+  corridorW: 3, wallH: 1.2, floorGap: 0,
+  idleResetSec: 90,
+  categories: {
+    clinic:   { th: 'คลินิก / ศูนย์', color: '#f7d3dc' },
+    service:  { th: 'บริการ',         color: '#d4ecf5' },
+    facility: { th: 'สิ่งอำนวยความสะดวก', color: '#dcefd2' },
+    shop:     { th: 'ร้านค้า',          color: '#fde9c4' },
+    core:     { th: 'ลิฟต์ / บันได',    color: '#dfe3ec' },
+  },
+  colors: { plate: '#f6f9fa', corridor: '#ffffff', wall: '#ffffff', ground: '#dbe7e3', route: '#0e93a8', start: '#2563eb', dest: '#d63d74', exit: '#15803d', fire: '#c62828' },
+};
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// ===== 2. MAP DATA (placeholder) =====
+/*
+ * MAP JSON SCHEMA (metres; +x = east, +z = south; each floor uses the same x/z frame)
+ * {
+ *   floors:    [ { id:'F1', nameTh:'ชั้น 1', x0, x1, z0, z1 } ],
+ *   corridors: [ { floor, a:[x,z], b:[x,z] } ]            // walkable centre-lines; segments must meet at shared end points
+ *   rooms:     [ { id, floor, nameTh, nameEn, cat, x0, x1, z0, z1, door:'N'|'S'|'E'|'W', kw:'search keywords', link? } ]
+ *              // the door sits at the middle of that side and is joined to the nearest corridor automatically
+ *              // link: rooms on different floors sharing a link id are joined vertically ('lift' | 'stairs' via kind)
+ *   links:     [ { id:'L1', kind:'lift'|'stairs', nameTh } ]
+ *   points:    [ { id, floor, kind:'exit'|'kiosk'|'firestairs', x, z, nameTh, link? } ]
+ * }
+ * Replace buildPlaceholderMap() with a CAD-derived JSON (or load ?map=url) — no rendering code changes needed.
+ */
+function buildPlaceholderMap() {
+  const M = { floors: [], corridors: [], rooms: [], links: [], points: [] };
+  M.floors.push({ id: 'F1', nameTh: 'ชั้น 1', short: '1', x0: -42, x1: 42, z0: -24, z1: 30 });
+  M.floors.push({ id: 'F2', nameTh: 'ชั้น 2', short: '2', x0: -42, x1: 42, z0: -24, z1: 26 });
+  const X = [-24, 0, 24], Z = [-22, 0, 22];
+  for (const f of ['F1', 'F2']) {
+    const end = f === 'F1' ? 42 : 40;
+    for (const z of Z) for (let i = 0; i < 2; i++) M.corridors.push({ floor: f, a: [X[i], z], b: [X[i + 1], z] });
+    for (const x of X) for (let i = 0; i < 2; i++) M.corridors.push({ floor: f, a: [x, Z[i]], b: [x, Z[i + 1]] });
+    M.corridors.push({ floor: f, a: [-end, 0], b: [-24, 0] }, { floor: f, a: [24, 0], b: [end, 0] });
+  }
+  M.corridors.push({ floor: 'F1', a: [0, -24], b: [0, -22] }, { floor: 'F1', a: [0, 22], b: [0, 30] });
+  M.links.push({ id: 'L1', kind: 'lift', nameTh: 'ลิฟต์ L1' }, { id: 'L2', kind: 'lift', nameTh: 'ลิฟต์ L2' }, { id: 'S1', kind: 'stairs', nameTh: 'บันได S1' },
+    { id: 'FW', kind: 'stairs', nameTh: 'บันไดหนีไฟฝั่งตะวันตก' }, { id: 'FE', kind: 'stairs', nameTh: 'บันไดหนีไฟฝั่งตะวันออก' });
+  const R = (floor, id, nameTh, nameEn, cat, x0, x1, z0, z1, door, kw = '', link) => M.rooms.push({ id: `${floor}-${id}`, floor, nameTh, nameEn, cat, x0, x1, z0, z1, door, kw, link });
+  const core = f => {   // lift / stairs / toilet cores repeat on every floor
+    R(f, 'L1', 'ลิฟต์ L1', 'Lift L1', 'core', -7.5, -1.5, -6.5, -1.5, 'S', 'ลิฟท์ lift elevator', 'L1');
+    R(f, 'S1', 'บันได S1', 'Stairs S1', 'core', -7.5, -1.5, -13, -7.5, 'E', 'บันได stairs', 'S1');
+    R(f, 'WC1', 'ห้องน้ำ (ชาย / หญิง / ผู้พิการ)', 'Restrooms', 'facility', -7.5, -1.5, -20.5, -14, 'E', 'ห้องน้ำ สุขา ห้องสุขา toilet restroom wc');
+    R(f, 'L2', 'ลิฟต์ L2', 'Lift L2', 'core', 15.5, 22.5, 1.5, 7, 'N', 'ลิฟท์ lift elevator', 'L2');
+    R(f, 'WC2', 'ห้องน้ำ (ชาย / หญิง / ผู้พิการ)', 'Restrooms', 'facility', 15.5, 22.5, 8, 20.5, 'E', 'ห้องน้ำ สุขา ห้องสุขา toilet restroom wc');
+  };
+  // ---- floor 1 ----
+  core('F1');
+  R('F1', 'HEART', 'ศูนย์หัวใจ', 'Heart Center', 'clinic', -22.5, -8.5, -20.5, -1.5, 'S', 'หัวใจ heart cardio คลื่นหัวใจ ekg echo');
+  R('F1', 'LAB', 'ห้องปฏิบัติการ (เจาะเลือด)', 'Laboratory', 'service', 1.5, 11.5, -20.5, -1.5, 'S', 'แล็บ lab เจาะเลือด ตรวจเลือด ปัสสาวะ');
+  R('F1', 'XRAY', 'รังสีวินิจฉัย (X-ray / CT)', 'Radiology', 'service', 12.5, 22.5, -20.5, -1.5, 'S', 'เอกซเรย์ xray x-ray ct mri รังสี');
+  R('F1', 'REC', 'เวชระเบียน / ทำบัตรผู้ป่วยใหม่', 'Medical Records', 'service', -22.5, -12.5, 1.5, 20.5, 'N', 'ทำบัตร บัตรใหม่ ลงทะเบียน ผู้ป่วยใหม่ เวชระเบียน register');
+  R('F1', 'CASH', 'การเงิน (ชำระเงิน)', 'Cashier', 'service', -11.5, -1.5, 1.5, 10.5, 'N', 'จ่ายเงิน ชำระเงิน การเงิน cashier payment');
+  R('F1', 'PRAY', 'ห้องละหมาด', 'Prayer Room', 'facility', -11.5, -1.5, 11.5, 20.5, 'E', 'ละหมาด prayer มุสลิม');
+  R('F1', 'PHARM', 'ห้องยา (รับยา)', 'Pharmacy', 'service', 1.5, 14.5, 1.5, 20.5, 'N', 'รับยา ยา เภสัช pharmacy ห้องยา');
+  R('F1', 'MED', 'OPD อายุรกรรม', 'Internal Medicine OPD', 'clinic', -42, -25.5, -24, -1.5, 'E', 'อายุรกรรม medicine opd ตรวจโรคทั่วไป');
+  R('F1', 'SUR', 'OPD ศัลยกรรม', 'Surgery OPD', 'clinic', -42, -25.5, 1.5, 30, 'E', 'ศัลยกรรม surgery ผ่าตัด แผล');
+  R('F1', 'KIDNEY', 'ศูนย์ไต (ไตเทียม)', 'Kidney Center', 'clinic', 25.5, 42, -24, -1.5, 'W', 'ไต ไตเทียม ฟอกไต kidney dialysis');
+  R('F1', 'BREAST', 'ศูนย์เต้านม', 'Breast Center', 'clinic', 25.5, 42, 1.5, 14, 'W', 'เต้านม breast แมมโมแกรม mammogram');
+  R('F1', 'INFO', 'จุดประชาสัมพันธ์', 'Information', 'facility', -12, -3.5, 23.5, 30, 'E', 'ประชาสัมพันธ์ สอบถาม information ติดต่อ');
+  R('F1', 'WHEEL', 'จุดบริการรถเข็น', 'Wheelchair Service', 'facility', -24, -13, 23.5, 30, 'N', 'รถเข็น wheelchair เปล');
+  R('F1', 'CAFE', 'ร้านกาแฟ', 'Café', 'shop', 3.5, 12, 23.5, 30, 'W', 'กาแฟ cafe coffee เครื่องดื่ม');
+  R('F1', 'SHOP', 'ร้านสะดวกซื้อ / ATM', 'Convenience Store / ATM', 'shop', 13, 24, 23.5, 30, 'N', 'ร้านค้า สะดวกซื้อ atm ตู้เอทีเอ็ม ถอนเงิน');
+  R('F1', 'NKC', 'NKC', 'NKC', 'clinic', 25.5, 42, 15, 30, 'W', 'nkc');
+  // ---- floor 2 ----
+  core('F2');
+  R('F2', 'PED', 'OPD กุมารเวชกรรม', 'Pediatrics OPD', 'clinic', -22.5, -8.5, -20.5, -1.5, 'S', 'เด็ก กุมาร pediatrics');
+  R('F2', 'OBG', 'OPD สูติ-นรีเวชกรรม', 'OB-GYN OPD', 'clinic', 1.5, 22.5, -20.5, -1.5, 'S', 'สูติ นรีเวช ฝากครรภ์ ตั้งครรภ์ obgyn');
+  R('F2', 'MEET', 'ห้องประชุม', 'Meeting Room', 'service', -22.5, -1.5, 1.5, 20.5, 'N', 'ประชุม meeting');
+  R('F2', 'EYE', 'คลินิกจักษุ', 'Eye Clinic', 'clinic', 1.5, 14.5, 1.5, 20.5, 'N', 'ตา จักษุ eye');
+  R('F2', 'ENT', 'OPD โสต ศอ นาสิก', 'ENT OPD', 'clinic', -42, -25.5, -24, -1.5, 'E', 'หู คอ จมูก ent');
+  R('F2', 'DEN', 'ทันตกรรม', 'Dental', 'clinic', -42, -25.5, 1.5, 26, 'E', 'ฟัน ทันตกรรม dental');
+  R('F2', 'THAN', 'ศูนย์ถันย์', 'Than Center', 'clinic', 25.5, 42, -24, -1.5, 'W', 'ถันย์');
+  R('F2', 'GER', 'คลินิกผู้สูงอายุ', 'Geriatric Clinic', 'clinic', 25.5, 42, 1.5, 26, 'W', 'ผู้สูงอายุ geriatric');
+  // ---- points ----
+  M.points.push(
+    { id: 'EX-MAIN', floor: 'F1', kind: 'exit', x: 0, z: 30, nameTh: 'ทางเข้า-ออกหลัก' },
+    { id: 'EX-W', floor: 'F1', kind: 'exit', x: -42, z: 0, nameTh: 'ทางออกฉุกเฉินตะวันตก' },
+    { id: 'EX-E', floor: 'F1', kind: 'exit', x: 42, z: 0, nameTh: 'ทางออกฉุกเฉินตะวันออก' },
+    { id: 'EX-N', floor: 'F1', kind: 'exit', x: 0, z: -24, nameTh: 'ทางออกฉุกเฉินเหนือ' },
+    { id: 'FW-1', floor: 'F1', kind: 'firestairs', x: -38, z: 0, nameTh: 'บันไดหนีไฟ', link: 'FW' },
+    { id: 'FW-2', floor: 'F2', kind: 'firestairs', x: -38, z: 0, nameTh: 'บันไดหนีไฟ', link: 'FW' },
+    { id: 'FE-1', floor: 'F1', kind: 'firestairs', x: 38, z: 0, nameTh: 'บันไดหนีไฟ', link: 'FE' },
+    { id: 'FE-2', floor: 'F2', kind: 'firestairs', x: 38, z: 0, nameTh: 'บันไดหนีไฟ', link: 'FE' },
+    { id: 'K1', floor: 'F1', kind: 'kiosk', x: 1.8, z: 27, nameTh: 'Kiosk โถงทางเข้าหลัก' },
+    { id: 'K2', floor: 'F1', kind: 'kiosk', x: -22.2, z: 8, nameTh: 'Kiosk ปีกตะวันตก' },
+    { id: 'K3', floor: 'F1', kind: 'kiosk', x: 22.2, z: -8, nameTh: 'Kiosk ปีกตะวันออก' },
+    { id: 'K4', floor: 'F2', kind: 'kiosk', x: 1.8, z: -4, nameTh: 'Kiosk ชั้น 2 หน้าลิฟต์' },
+  );
+  return M;
+}
+
+// ===== 3. ROUTING GRAPH =====
+function buildGraph(M) {
+  const G = { nodes: new Map(), adj: new Map(), M, floors: new Map(M.floors.map(f => [f.id, f])), roomById: new Map(), linkById: new Map(M.links.map(l => [l.id, l])) };
+  const key = (f, x, z) => `${f}:${x.toFixed(2)}:${z.toFixed(2)}`;
+  const node = (f, x, z, extra = {}) => { const k = key(f, x, z); let n = G.nodes.get(k); if (!n) { n = { id: k, floor: f, x, z, ...extra }; G.nodes.set(k, n); G.adj.set(k, []); } else Object.assign(n, extra); return n; };
+  const edge = (a, b, kind = 'walk', extra = {}) => { const len = Math.hypot(a.x - b.x, a.z - b.z); G.adj.get(a.id).push({ to: b.id, len, kind, ...extra }); G.adj.get(b.id).push({ to: a.id, len, kind, ...extra }); };
+  const segs = M.corridors.map(c => ({ ...c, pts: [{ t: 0, x: c.a[0], z: c.a[1] }, { t: 1, x: c.b[0], z: c.b[1] }] }));
+  const attach = (floor, x, z) => {     // project a point onto the nearest corridor segment of its floor
+    let best = null;
+    for (const s of segs) {
+      if (s.floor !== floor) continue;
+      const ax = s.a[0], az = s.a[1], dx = s.b[0] - ax, dz = s.b[1] - az, L2 = dx * dx + dz * dz;
+      const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / L2)), px = ax + t * dx, pz = az + t * dz, d = Math.hypot(x - px, z - pz);
+      if (!best || d < best.d) best = { s, t, px, pz, d };
+    }
+    best.s.pts.push({ t: best.t, x: best.px, z: best.pz });
+    return best;
+  };
+  const pending = [];
+  for (const r of M.rooms) {
+    G.roomById.set(r.id, r);
+    const cx = (r.x0 + r.x1) / 2, cz = (r.z0 + r.z1) / 2;
+    const d = { N: [cx, r.z0], S: [cx, r.z1], W: [r.x0, cz], E: [r.x1, cz] }[r.door];
+    r.doorX = d[0]; r.doorZ = d[1]; r.cx = cx; r.cz = cz;
+    const p = attach(r.floor, d[0], d[1]); pending.push({ kind: 'room', r, p });
+  }
+  for (const pt of M.points) { const p = attach(pt.floor, pt.x, pt.z); pending.push({ kind: 'point', pt, p }); }
+  for (const s of segs) {
+    s.pts.sort((a, b) => a.t - b.t);
+    for (let i = 1; i < s.pts.length; i++) { const a = node(s.floor, s.pts[i - 1].x, s.pts[i - 1].z), b = node(s.floor, s.pts[i].x, s.pts[i].z); if (a !== b) edge(a, b); }
+  }
+  const linkNodes = new Map();
+  for (const it of pending) {
+    if (it.kind === 'room') {
+      const r = it.r, door = node(r.floor, r.doorX, r.doorZ, { room: r.id }), on = node(r.floor, it.p.px, it.p.pz);
+      if (door !== on) edge(door, on); r.node = door.id;
+      if (r.link) { const c = node(r.floor, r.cx, r.cz, { linkId: r.link }); edge(c, door); (linkNodes.get(r.link) || linkNodes.set(r.link, []).get(r.link)).push(c); }
+    } else {
+      const pt = it.pt, n = node(pt.floor, pt.x, pt.z, { point: pt.id, pkind: pt.kind }), on = node(pt.floor, it.p.px, it.p.pz);
+      if (n !== on) edge(n, on); pt.node = n.id;
+      if (pt.link) (linkNodes.get(pt.link) || linkNodes.set(pt.link, []).get(pt.link)).push(n);
+    }
+  }
+  const order = M.floors.map(f => f.id);
+  for (const [id, ns] of linkNodes) {
+    const L = G.linkById.get(id); ns.sort((a, b) => order.indexOf(a.floor) - order.indexOf(b.floor));
+    for (let i = 1; i < ns.length; i++) edge(ns[i - 1], ns[i], L.kind, { link: id });
+  }
+  return G;
+}
+// Dijkstra; opts: { noStairs, noLifts }. Returns { path:[nodeId], cost } to the cheapest of `targets`.
+function route(G, from, targets, opts = {}) {
+  const T = new Set(targets), dist = new Map([[from, 0]]), prev = new Map(), done = new Set();
+  const open = [from];
+  while (open.length) {
+    let bi = 0; for (let i = 1; i < open.length; i++) if (dist.get(open[i]) < dist.get(open[bi])) bi = i;
+    const u = open.splice(bi, 1)[0]; if (done.has(u)) continue; done.add(u);
+    if (T.has(u)) { const path = [u]; let c = u; while (prev.has(c)) { c = prev.get(c); path.unshift(c); } return { path, cost: dist.get(u) }; }
+    for (const e of G.adj.get(u)) {
+      if (opts.noStairs && e.kind === 'stairs') continue; if (opts.noLifts && e.kind === 'lift') continue;
+      const w = e.kind === 'walk' ? e.len : e.kind === 'lift' ? CONFIG.lift.costM : CONFIG.stairs.costM;
+      const nd = dist.get(u) + w;
+      if (!dist.has(e.to) || nd < dist.get(e.to)) { dist.set(e.to, nd); prev.set(e.to, u); open.push(e.to); }
+    }
+  }
+  return null;
+}
+const edgeBetween = (G, a, b) => G.adj.get(a).find(e => e.to === b);
+// Turn a node path into readable Thai steps and totals.
+function describe(G, path, opts) {
+  const N = id => G.nodes.get(id), steps = []; let walk = 0, extraSec = 0;
+  const compass = (dx, dz) => Math.abs(dx) > Math.abs(dz) ? (dx > 0 ? 'ทิศตะวันออก' : 'ทิศตะวันตก') : (dz > 0 ? 'ทิศใต้' : 'ทิศเหนือ');
+  const landmark = (f, x, z) => { let best = null; for (const r of G.M.rooms) { if (r.floor !== f || r.cat === 'core') continue; const d = Math.hypot(r.doorX - x, r.doorZ - z); if (d < 6 && (!best || d < best.d)) best = { r, d }; } return best ? best.r.nameTh : ''; };
+  let run = [path[0]];
+  const flush = () => {
+    const pts = run.map(N); if (pts.length < 2) return;
+    const segs = [];
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i], len = Math.hypot(b.x - a.x, b.z - a.z); if (len < 0.05) continue;
+      const dx = (b.x - a.x) / len, dz = (b.z - a.z) / len, last = segs[segs.length - 1];
+      if (last && last.dx * dx + last.dz * dz > 0.985) { last.len += len; last.b = b; } else segs.push({ a, b, len, dx, dz });
+    }
+    segs.forEach((s, i) => {
+      walk += s.len; const m = Math.max(1, Math.round(s.len));
+      if (i === 0 && !steps.length) { steps.push({ ic: '↑', text: `ออกเดินไปทาง${compass(s.dx, s.dz)} ${m} ม.`, floor: s.a.floor, x: s.a.x, z: s.a.z }); return; }
+      if (i === 0) { steps.push({ ic: '↑', text: `ออกจาก${G.linkById.get(N(run[0]).linkId || '')?.nameTh || 'จุดนี้'} เดินไปทาง${compass(s.dx, s.dz)} ${m} ม.`, floor: s.a.floor, x: s.a.x, z: s.a.z }); return; }
+      const p = segs[i - 1], cross = p.dx * s.dz - p.dz * s.dx, dot = p.dx * s.dx + p.dz * s.dz;
+      const turn = dot < -0.7 ? 'กลับหลัง' : cross < 0 ? 'เลี้ยวซ้าย' : 'เลี้ยวขวา', lm = landmark(s.a.floor, s.a.x, s.a.z);
+      steps.push({ ic: dot < -0.7 ? '↓' : cross < 0 ? '←' : '→', text: `${turn} แล้วเดินตรงไป ${m} ม.`, sub: lm ? `ตรงจุดใกล้ ${lm}` : '', floor: s.a.floor, x: s.a.x, z: s.a.z });
+    });
+  };
+  for (let k = 1; k < path.length; k++) {
+    const a = N(path[k - 1]), b = N(path[k]);
+    if (a.floor !== b.floor) {
+      flush(); const e = edgeBetween(G, a.id, b.id), L = G.linkById.get(e.link), up = G.M.floors.findIndex(f => f.id === b.floor) > G.M.floors.findIndex(f => f.id === a.floor);
+      const fb = G.floors.get(b.floor).nameTh;
+      if (e.kind === 'lift') { extraSec += CONFIG.lift.waitSec; steps.push({ ic: up ? '⇧' : '⇩', v: true, text: `ใช้${L.nameTh} ${up ? 'ขึ้น' : 'ลง'}ไป${fb}`, floor: a.floor, x: a.x, z: a.z, to: b.floor }); }
+      else { extraSec += CONFIG.stairs.secPerFloor; steps.push({ ic: up ? '⇧' : '⇩', v: true, text: `${up ? 'ขึ้น' : 'ลง'}${L.nameTh} ไป${fb}`, floor: a.floor, x: a.x, z: a.z, to: b.floor }); }
+      run = [path[k]];
+    } else run.push(path[k]);
+  }
+  flush();
+  const speed = opts.noStairs ? CONFIG.speed.wheelchair : CONFIG.speed.walk;
+  const floors = [...new Set(path.map(id => N(id).floor))];
+  return { steps, meters: walk, seconds: walk / speed + extraSec, floors };
+}
+
+// ===== 4. SCENE =====
+const BOX_FACES = [[[1,0,0],[[.5,-.5,.5],[.5,-.5,-.5],[.5,.5,-.5],[.5,.5,.5]]],[[-1,0,0],[[-.5,-.5,-.5],[-.5,-.5,.5],[-.5,.5,.5],[-.5,.5,-.5]]],[[0,1,0],[[-.5,.5,.5],[.5,.5,.5],[.5,.5,-.5],[-.5,.5,-.5]]],[[0,-1,0],[[-.5,-.5,-.5],[.5,-.5,-.5],[.5,-.5,.5],[-.5,-.5,.5]]],[[0,0,1],[[-.5,-.5,.5],[.5,-.5,.5],[.5,.5,.5],[-.5,.5,.5]]],[[0,0,-1],[[.5,-.5,-.5],[-.5,-.5,-.5],[-.5,.5,-.5],[.5,.5,-.5]]]];
+class Batch {
+  constructor() { this.p = []; this.n = []; this.c = []; this.i = []; this.k = 0; }
+  box(cx, cy, cz, w, h, d, hex) { const c = new THREE.Color(hex); for (const [nr, cs] of BOX_FACES) { for (const v of cs) { this.p.push(cx + v[0] * w, cy + v[1] * h, cz + v[2] * d); this.n.push(...nr); this.c.push(c.r, c.g, c.b); } this.i.push(this.k, this.k + 1, this.k + 2, this.k, this.k + 2, this.k + 3); this.k += 4; } }
+  mesh() { const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(this.p, 3)); g.setAttribute('normal', new THREE.Float32BufferAttribute(this.n, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(this.c, 3)); g.setIndex(this.i); const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors: true })); m.castShadow = m.receiveShadow = true; return m; }
+}
+class MapView {
+  constructor(el, G) {
+    this.G = G; this.el = el; this.floor = G.M.floors[0].id; this.groups = new Map(); this.labels = new Map(); this.picks = []; this.routeObjs = []; this.anim = null; this.tween = null; this.onPickRoom = null; this.onPickPoint = null;
+    const r = this.renderer = new THREE.WebGLRenderer({ antialias: true }); r.setPixelRatio(Math.min(devicePixelRatio || 1, 2)); r.shadowMap.enabled = true; r.shadowMap.type = THREE.PCFSoftShadowMap; el.appendChild(r.domElement);
+    this.lr = new CSS2DRenderer(); this.lr.domElement.className = 'css2d'; el.appendChild(this.lr.domElement);
+    this.scene = new THREE.Scene(); this.scene.background = new THREE.Color('#e8eff0');
+    this.viewH = 70; this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 1, 800);
+    this.camera.position.set(140, 140, 140);
+    const c = this.controls = new OrbitControls(this.camera, r.domElement);
+    c.enableDamping = true; c.dampingFactor = 0.12; c.screenSpacePanning = false; c.minZoom = 0.3; c.maxZoom = 6;
+    c.minAzimuthAngle = Math.PI / 4 - 0.7; c.maxAzimuthAngle = Math.PI / 4 + 0.7; c.minPolarAngle = 0.5; c.maxPolarAngle = 1.2;
+    this.scene.add(new THREE.HemisphereLight('#ffffff', '#c6d6d3', 1.6));
+    const sun = new THREE.DirectionalLight('#fff7ec', 2.1); sun.position.set(-40, 100, 60); sun.castShadow = true; sun.shadow.mapSize.set(2048, 2048);
+    Object.assign(sun.shadow.camera, { left: -70, right: 70, top: 70, bottom: -70, near: 1, far: 300 }); sun.shadow.normalBias = 0.04; this.scene.add(sun);
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), new THREE.MeshLambertMaterial({ color: CONFIG.colors.ground })); ground.rotation.x = -Math.PI / 2; ground.position.y = -0.6; ground.receiveShadow = true; this.scene.add(ground);
+    for (const f of G.M.floors) this.buildFloor(f);
+    this.buildMarkers();
+    this.resize(); addEventListener('resize', () => this.resize());
+    this.setupPick();
+    this.setFloor(this.floor, false);
+    let last = performance.now();
+    const loop = t => { requestAnimationFrame(loop); const dt = Math.min(0.1, (t - last) / 1000); last = t; if (document.hidden) return; this.update(dt, t / 1000); r.render(this.scene, this.camera); this.lr.render(this.scene, this.camera); };
+    requestAnimationFrame(loop);
+  }
+  label(group, floorId, html, cls, x, y, z, onClick) {
+    const d = document.createElement('div'); d.className = 'rl ' + (cls || ''); d.innerHTML = html;
+    if (onClick) { d.style.pointerEvents = 'auto'; d.style.cursor = 'pointer'; d.addEventListener('click', onClick); }
+    const o = new CSS2DObject(d); o.position.set(x, y, z); group.add(o);
+    (this.labels.get(floorId) || this.labels.set(floorId, []).get(floorId)).push(o); return o;
+  }
+  buildFloor(f) {
+    const G = this.G, g = new THREE.Group(), B = new Batch(), C = CONFIG.colors, W = CONFIG.wallH;
+    B.box((f.x0 + f.x1) / 2, -0.25, (f.z0 + f.z1) / 2, f.x1 - f.x0, 0.5, f.z1 - f.z0, C.plate);
+    B.box((f.x0 + f.x1) / 2, -0.55, (f.z0 + f.z1) / 2, f.x1 - f.x0 + 1.4, 0.1, f.z1 - f.z0 + 1.4, '#cbd9d6');
+    for (const c of G.M.corridors) {
+      if (c.floor !== f.id) continue;
+      const [ax, az] = c.a, [bx, bz] = c.b, w = CONFIG.corridorW;
+      B.box((ax + bx) / 2, 0.02, (az + bz) / 2, Math.abs(bx - ax) + w, 0.04, Math.abs(bz - az) + w, C.corridor);
+    }
+    // outer walls: tall on the far sides, low on the sides facing the camera
+    B.box((f.x0 + f.x1) / 2, 1.3, f.z0 + 0.15, f.x1 - f.x0, 2.6, 0.3, C.wall);
+    B.box(f.x0 + 0.15, 1.3, (f.z0 + f.z1) / 2, 0.3, 2.6, f.z1 - f.z0, C.wall);
+    B.box(f.x1 - 0.15, 0.3, (f.z0 + f.z1) / 2, 0.3, 0.6, f.z1 - f.z0, C.wall);
+    B.box((f.x0 + f.x1) / 2, 0.3, f.z1 - 0.15, f.x1 - f.x0, 0.6, 0.3, C.wall);
+    for (const r of G.M.rooms) {
+      if (r.floor !== f.id) continue;
+      const w = r.x1 - r.x0, d = r.z1 - r.z0, col = CONFIG.categories[r.cat].color;
+      B.box(r.cx, 0.04, r.cz, w - 0.2, 0.08, d - 0.2, col);
+      const gap = 2.4, t = 0.18;
+      const wall = (side, x0, z0, x1, z1) => {          // a wall along one side, with a door gap if this is the door side
+        const horiz = z0 === z1, len = horiz ? x1 - x0 : z1 - z0;
+        if (side !== r.door) { B.box(horiz ? (x0 + x1) / 2 : x0, W / 2, horiz ? z0 : (z0 + z1) / 2, horiz ? len : t, W, horiz ? t : len, C.wall); return; }
+        const mid = horiz ? (x0 + x1) / 2 : (z0 + z1) / 2, l1 = len / 2 - gap / 2;
+        if (l1 <= 0.1) return;
+        if (horiz) { B.box(x0 + l1 / 2, W / 2, z0, l1, W, t, C.wall); B.box(x1 - l1 / 2, W / 2, z0, l1, W, t, C.wall); }
+        else { B.box(x0, W / 2, z0 + l1 / 2, t, W, l1, C.wall); B.box(x0, W / 2, z1 - l1 / 2, t, W, l1, C.wall); }
+        void mid;
+      };
+      wall('N', r.x0, r.z0, r.x1, r.z0); wall('S', r.x0, r.z1, r.x1, r.z1); wall('W', r.x0, r.z0, r.x0, r.z1); wall('E', r.x1, r.z0, r.x1, r.z1);
+      if (r.link) { const L = G.linkById.get(r.link); if (L.kind === 'lift') { B.box(r.cx - 1.3, 1.1, r.cz, 2, 2.2, 2, '#c9d1dd'); B.box(r.cx + 1.3, 1.1, r.cz, 2, 2.2, 2, '#c9d1dd'); } else for (let s = 0; s < 6; s++) B.box(r.cx - 2 + s * 0.8, 0.1 + s * 0.16, r.cz, 0.8, 0.2 + s * 0.32, 3, '#d5dbe4'); }
+      const pick = new THREE.Mesh(new THREE.PlaneGeometry(w, d).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }));
+      pick.position.set(r.cx, 0.15, r.cz); pick.userData.room = r.id; g.add(pick); this.picks.push(pick);
+      const small = r.cat === 'core' || r.cat === 'facility' || r.cat === 'shop';
+      this.label(g, f.id, `<i style="background:${col}"></i>${r.nameTh}`, small ? 'small' : '', r.cx, small ? 1.6 : 2.2, r.cz, () => this.onPickRoom && this.onPickRoom(r.id));
+    }
+    for (const p of G.M.points) {
+      if (p.floor !== f.id) continue;
+      if (p.kind === 'exit') { B.box(p.x, 0.05, p.z, 3.4, 0.1, 3.4, '#bfe6cb'); this.label(g, f.id, 'ทางออก EXIT', 'exit', p.x, 2.4, p.z); }
+      if (p.kind === 'firestairs') { B.box(p.x, 0.06, p.z, 2.6, 0.12, 2.6, '#f5c9c9'); this.label(g, f.id, 'บันไดหนีไฟ', 'small', p.x, 1.6, p.z + 1.6); }
+      if (p.kind === 'kiosk') { B.box(p.x, 0.75, p.z, 0.6, 1.5, 0.6, '#3b6fd8'); this.label(g, f.id, p.id, 'kiosk', p.x, 2.1, p.z); }
+    }
+    this.label(g, f.id, '↑ N', 'compass', f.x0 + 4, 0.2, f.z0 - 3);
+    const plate = new THREE.Mesh(new THREE.PlaneGeometry(f.x1 - f.x0, f.z1 - f.z0).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }));
+    plate.position.set((f.x0 + f.x1) / 2, 0.05, (f.z0 + f.z1) / 2); plate.userData.plate = f.id; g.add(plate); this.plate = this.plate || new Map(); this.plate.set(f.id, plate);
+    g.add(B.mesh()); this.scene.add(g); this.groups.set(f.id, g);
+  }
+  buildMarkers() {
+    const mk = (color) => { const g = new THREE.Group(); const pin = new THREE.Mesh(new THREE.ConeGeometry(0.7, 1.8, 20).rotateX(Math.PI), new THREE.MeshLambertMaterial({ color })); pin.position.y = 1.6; const ball = new THREE.Mesh(new THREE.SphereGeometry(0.85, 20, 14), new THREE.MeshLambertMaterial({ color })); ball.position.y = 2.8; const ring = new THREE.Mesh(new THREE.RingGeometry(0.9, 1.4, 32).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.6, side: THREE.DoubleSide })); ring.position.y = 0.12; g.add(pin, ball, ring); pin.castShadow = ball.castShadow = true; g.userData.ring = ring; g.visible = false; this.scene.add(g); return g; };
+    this.startM = mk(CONFIG.colors.start); this.destM = mk(CONFIG.colors.dest);
+    const lab = (cls) => { const d = document.createElement('div'); d.className = 'rl ' + cls; const o = new CSS2DObject(d); o.position.y = 4.4; return o; };
+    this.startL = lab('start'); this.startM.add(this.startL); this.destL = lab('dest'); this.destM.add(this.destL);
+    this.dot = new THREE.Mesh(new THREE.SphereGeometry(0.55, 16, 12), new THREE.MeshBasicMaterial({ color: '#ffffff' }));
+    const halo = new THREE.Mesh(new THREE.SphereGeometry(0.85, 16, 12), new THREE.MeshBasicMaterial({ color: CONFIG.colors.route, transparent: true, opacity: 0.45 })); this.dot.add(halo); this.dot.visible = false; this.scene.add(this.dot);
+  }
+  setMarker(which, node, text) {
+    const m = which === 'start' ? this.startM : this.destM, l = which === 'start' ? this.startL : this.destL;
+    if (!node) { m.visible = false; m.userData.floor = null; l.visible = false; return; }
+    m.position.set(node.x, 0, node.z); m.userData.floor = node.floor; l.element.textContent = text; this.syncVisibility();
+  }
+  syncVisibility() {
+    for (const [id, g] of this.groups) g.visible = id === this.floor;
+    for (const [id, arr] of this.labels) for (const o of arr) o.visible = id === this.floor;
+    for (const m of [this.startM, this.destM]) { const v = m.userData.floor === this.floor; m.visible = v; m.children.forEach(c => { if (c.isCSS2DObject) c.visible = v; }); }
+    for (const o of this.routeObjs) o.visible = o.userData.floor === this.floor;
+  }
+  setFloor(id, animate = true) { this.floor = id; this.syncVisibility(); this.onFloor && this.onFloor(id); }
+  setupPick() {
+    const ray = new THREE.Raycaster(), v = new THREE.Vector2(), dom = this.renderer.domElement; let down = null;
+    dom.addEventListener('pointerdown', e => { down = { x: e.clientX, y: e.clientY }; });
+    dom.addEventListener('pointerup', e => {
+      if (!down || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6) { down = null; return; } down = null;
+      const rc = dom.getBoundingClientRect(); v.set((e.clientX - rc.left) / rc.width * 2 - 1, -(e.clientY - rc.top) / rc.height * 2 + 1); ray.setFromCamera(v, this.camera);
+      if (this.pickPointMode) { const h = ray.intersectObject(this.plate.get(this.floor))[0]; if (h && this.onPickPoint) this.onPickPoint(this.floor, h.point.x, h.point.z); return; }
+      const h = ray.intersectObjects(this.picks.filter(p => p.parent.visible))[0]; if (h && this.onPickRoom) this.onPickRoom(h.object.userData.room);
+    });
+  }
+  showRoute(pathNodes) {
+    for (const o of this.routeObjs) { o.parent && o.parent.remove(o); o.geometry && o.geometry.dispose(); } this.routeObjs = [];
+    if (!pathNodes) { this.dot.visible = false; this.anim = null; return; }
+    const mat = new THREE.MeshBasicMaterial({ color: CONFIG.colors.route }), pts = [];
+    for (let i = 1; i < pathNodes.length; i++) {
+      const a = pathNodes[i - 1], b = pathNodes[i];
+      if (a.floor !== b.floor) { pts.push({ x: b.x, z: b.z, floor: b.floor, jump: true }); continue; }
+      const len = Math.hypot(b.x - a.x, b.z - a.z); if (len < 0.01) continue;
+      const m = new THREE.Mesh(new THREE.BoxGeometry(len + 0.9, 0.08, 0.9), mat); m.position.set((a.x + b.x) / 2, 0.16, (a.z + b.z) / 2); m.rotation.y = -Math.atan2(b.z - a.z, b.x - a.x);
+      m.userData.floor = a.floor; this.groups.get(a.floor).add(m); this.routeObjs.push(m);
+      if (!pts.length) pts.push({ x: a.x, z: a.z, floor: a.floor }); pts.push({ x: b.x, z: b.z, floor: b.floor });
+    }
+    let acc = 0; pts.forEach((p, i) => { if (i && !p.jump) acc += Math.hypot(p.x - pts[i - 1].x, p.z - pts[i - 1].z); p.s = acc; });
+    this.anim = { pts, total: acc, s: 0 }; this.syncVisibility();
+  }
+  update(dt, t) {
+    for (const m of [this.startM, this.destM]) if (m.visible && !REDUCED) { const r = m.userData.ring, k = 1 + 0.35 * (0.5 + 0.5 * Math.sin(t * 3.5)); r.scale.set(k, 1, k); r.material.opacity = 0.75 - 0.4 * (k - 1); }
+    const A = this.anim;
+    if (A && A.total > 0 && !REDUCED) {
+      A.s = (A.s + dt * 9) % (A.total + 6); const s = Math.min(A.s, A.total);
+      let i = 1; while (i < A.pts.length - 1 && A.pts[i].s < s) i++;
+      const a = A.pts[i - 1], b = A.pts[i], seg = b.s - a.s, k = seg > 0 ? (s - a.s) / seg : 1;
+      const fl = b.jump ? b.floor : a.floor;
+      this.dot.position.set(b.jump ? b.x : a.x + (b.x - a.x) * k, 0.8, b.jump ? b.z : a.z + (b.z - a.z) * k); this.dot.visible = fl === this.floor;
+    } else this.dot.visible = false;
+    if (this.tween) {
+      const w = this.tween, k = Math.min(1, (performance.now() - w.t0) / w.dur), e = k < 0.5 ? 4 * k ** 3 : 1 - Math.pow(-2 * k + 2, 3) / 2;
+      const off = this.camera.position.clone().sub(this.controls.target);
+      this.controls.target.set(w.a.x + (w.b.x - w.a.x) * e, 0, w.a.z + (w.b.z - w.a.z) * e); this.camera.position.copy(this.controls.target).add(off);
+      this.camera.zoom = w.a.zoom + (w.b.zoom - w.a.zoom) * e; this.camera.updateProjectionMatrix(); if (k >= 1) this.tween = null;
+    }
+    this.controls.update();
+  }
+  resize() {
+    const w = this.el.clientWidth || innerWidth, h = this.el.clientHeight || innerHeight, a = w / h, c = this.camera;
+    this.renderer.setSize(w, h); this.lr.setSize(w, h); c.left = -this.viewH * a / 2; c.right = this.viewH * a / 2; c.top = this.viewH / 2; c.bottom = -this.viewH / 2; c.updateProjectionMatrix();
+  }
+  // fit a ground rectangle into the free part of the screen (insets in px: panel on the left / bottom sheet on phones)
+  fit(r, animate = true) {
+    const c = this.camera; c.updateMatrixWorld(); const e = c.matrixWorld.elements, rx = e[0], ry = e[1], rz = e[2], ux = e[4], uy = e[5], uz = e[6];
+    let a0 = 1e9, a1 = -1e9, b0 = 1e9, b1 = -1e9;
+    for (const x of [r.x0, r.x1]) for (const z of [r.z0, r.z1]) for (const y of [0, 2.5]) { const sx = x * rx + y * ry + z * rz, sy = x * ux + y * uy + z * uz; a0 = Math.min(a0, sx); a1 = Math.max(a1, sx); b0 = Math.min(b0, sy); b1 = Math.max(b1, sy); }
+    const W = this.el.clientWidth || innerWidth, H = this.el.clientHeight || innerHeight, ins = this.insets ? this.insets() : { l: 0, r: 0, t: 0, b: 0 };
+    const fw = Math.max(120, W - ins.l - ins.r), fh = Math.max(120, H - ins.t - ins.b), vw = this.viewH * W / H;
+    const zoom = Math.max(this.controls.minZoom, Math.min(this.controls.maxZoom, Math.min(vw * fw / W / ((a1 - a0) * 1.1), this.viewH * fh / H / ((b1 - b0) * 1.1))));
+    const pxW = vw / zoom / W, cx = (a0 + a1) / 2 - ((ins.l - ins.r) / 2) * pxW, cy = (b0 + b1) / 2 - ((ins.b - ins.t) / 2) * pxW;
+    const det = rx * uz - rz * ux, x = (cx * uz - rz * cy) / det, z = (rx * cy - cx * ux) / det;
+    if (!animate) { const off = c.position.clone().sub(this.controls.target); this.controls.target.set(x, 0, z); c.position.copy(this.controls.target).add(off); c.zoom = zoom; c.updateProjectionMatrix(); return; }
+    this.tween = { t0: performance.now(), dur: REDUCED ? 1 : 900, a: { x: this.controls.target.x, z: this.controls.target.z, zoom: c.zoom }, b: { x, z, zoom } };
+  }
+  fitFloor(id, animate) { const f = this.G.floors.get(id); this.fit({ x0: f.x0, x1: f.x1, z0: f.z0, z1: f.z1 }, animate); }
+}
+
+// ===== 5. UI =====
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+const norm = s => s.toLowerCase().replace(/\s+/g, '');
+const Q = new URLSearchParams(location.search);
+const M = buildPlaceholderMap(), G = buildGraph(M);
+const S = { start: null, startLabel: '', dest: null, destRoom: null, mode: 'room', cat: 'all', kiosk: null, lastRoute: null };
+const kioskId = (Q.get('kiosk') || location.hash.replace('#', '')).toUpperCase();
+const kiosks = M.points.filter(p => p.kind === 'kiosk');
+if (kiosks.some(k => k.id === kioskId)) S.kiosk = kioskId;
+
+const view = new MapView($('#stage'), G);
+view.insets = () => innerWidth <= 760 ? { l: 0, r: 70, t: 70, b: innerHeight * 0.52 } : { l: document.querySelector('.panel').offsetWidth + 24, r: 90, t: 40, b: 10 };
+const toast = msg => { const t = $('#toast'); t.textContent = msg; t.hidden = false; clearTimeout(toast.h); toast.h = setTimeout(() => t.hidden = true, 2600); };
+
+// floors switcher (top floor first)
+const floorBtns = new Map();
+[...M.floors].reverse().forEach(f => { const b = document.createElement('button'); b.innerHTML = `${f.short}<small>${f.nameTh}</small><span class="has" hidden></span>`; b.setAttribute('aria-label', f.nameTh); b.onclick = () => { view.setFloor(f.id); view.fitFloor(f.id); }; $('#floors').appendChild(b); floorBtns.set(f.id, b); });
+view.onFloor = id => floorBtns.forEach((b, k) => b.setAttribute('aria-pressed', String(k === id)));
+view.onFloor(view.floor);
+// legend
+$('#legend').innerHTML = Object.values(CONFIG.categories).map(c => `<div><i style="background:${c.color}"></i>${c.th}</div>`).join('') + `<div><span class="ln"></span>เส้นทางนำทาง</div>`;
+// start selector
+$('#start').innerHTML = kiosks.map(k => `<option value="${k.id}">${k.id} · ${esc(k.nameTh)} (${G.floors.get(k.floor).nameTh})</option>`).join('') + `<option value="custom" hidden>จุดที่เลือกบนแผนที่</option>`;
+function setStartKiosk(id) { const k = kiosks.find(x => x.id === id); S.start = k.node; S.startLabel = 'คุณอยู่ที่นี่'; S.startName = k.nameTh; $('#start').value = id; view.setMarker('start', G.nodes.get(k.node), S.startLabel); if (G.nodes.get(k.node).floor !== view.floor) view.setFloor(G.nodes.get(k.node).floor); recompute(); }
+$('#start').onchange = e => { if (e.target.value !== 'custom') setStartKiosk(e.target.value); };
+$('#pickStart').onclick = () => { const on = $('#pickStart').getAttribute('aria-pressed') !== 'true'; $('#pickStart').setAttribute('aria-pressed', String(on)); view.pickPointMode = on; if (on) toast('แตะทางเดินบนแผนที่เพื่อกำหนดจุดเริ่มต้น'); };
+view.onPickPoint = (floor, x, z) => {
+  let best = null; for (const n of G.nodes.values()) { if (n.floor !== floor || n.linkId) continue; const d = Math.hypot(n.x - x, n.z - z); if (!best || d < best.d) best = { n, d }; }
+  if (!best) return; S.start = best.n.id; S.startLabel = 'จุดเริ่มต้น'; S.startName = 'จุดที่เลือกบนแผนที่'; $('#start').value = 'custom';
+  view.setMarker('start', best.n, S.startLabel); view.pickPointMode = false; $('#pickStart').setAttribute('aria-pressed', 'false'); recompute();
+};
+// search
+const cats = [['all', 'ทั้งหมด'], ...Object.entries(CONFIG.categories).filter(([k]) => k !== 'core').map(([k, v]) => [k, v.th])];
+$('#chips').innerHTML = cats.map(([k, t]) => `<button class="chip" data-cat="${k}" aria-pressed="${k === 'all'}">${t}</button>`).join('');
+document.querySelectorAll('[data-cat]').forEach(b => b.onclick = () => { S.cat = b.dataset.cat; document.querySelectorAll('[data-cat]').forEach(x => x.setAttribute('aria-pressed', String(x === b))); renderResults(); });
+// one entry per destination name per floor (toilets appear on every floor; the nearest is chosen when routing)
+function renderResults() {
+  const q = norm($('#q').value), rooms = M.rooms.filter(r => r.cat !== 'core' && (S.cat === 'all' || r.cat === S.cat) && (!q || norm(r.nameTh + r.nameEn + r.kw).includes(q)));
+  const seen = new Set(), list = [];
+  for (const r of rooms) { const k = r.nameTh + '|' + r.floor; if (seen.has(k)) continue; seen.add(k); list.push(r); }
+  const order = Object.keys(CONFIG.categories);
+  list.sort((a, b) => order.indexOf(a.cat) - order.indexOf(b.cat) || a.floor.localeCompare(b.floor) || a.nameTh.localeCompare(b.nameTh, 'th'));
+  $('#results').innerHTML = list.length ? list.map(r => `<li><button data-room="${r.id}" aria-current="${S.destRoom && G.roomById.get(S.destRoom).nameTh === r.nameTh && G.roomById.get(S.destRoom).floor === r.floor}"><span class="dot" style="background:${CONFIG.categories[r.cat].color}"></span><span>${esc(r.nameTh)}<span class="en">${esc(r.nameEn)}</span></span><span class="fl">${G.floors.get(r.floor).nameTh}</span></button></li>`).join('') : `<li class="empty">ไม่พบปลายทางที่ตรงกับ “${esc($('#q').value)}” ลองค้นด้วยคำอื่น เช่น ยา, เลือด, ห้องน้ำ</li>`;
+  document.querySelectorAll('[data-room]').forEach(b => b.onclick = () => goTo(b.dataset.room));
+}
+$('#q').oninput = renderResults;
+$('#q').onkeydown = e => { if (e.key === 'Enter') { const b = document.querySelector('[data-room]'); if (b) goTo(b.dataset.room); } };
+view.onPickRoom = id => { const r = G.roomById.get(id); if (r.cat === 'core') { toast(`${r.nameTh} — เลือกปลายทางเป็นห้องหรือบริการ`); return; } goTo(id); };
+
+function goTo(roomId) {
+  const r = G.roomById.get(roomId); S.mode = 'room';
+  // same-named rooms (e.g. restrooms): route to the cheapest one, preferring the start floor
+  S.destCandidates = M.rooms.filter(x => x.nameTh === r.nameTh && x.floor === r.floor).map(x => x.id);
+  if (r.cat === 'facility' && /ห้องน้ำ/.test(r.nameTh)) S.destCandidates = M.rooms.filter(x => x.nameTh === r.nameTh).map(x => x.id);
+  S.destRoom = roomId; recompute(true); renderResults();
+}
+function goSOS() { S.mode = 'sos'; S.destRoom = null; recompute(true); }
+$('#sos').onclick = goSOS;
+$('#clear').onclick = () => { S.mode = 'room'; S.destRoom = null; S.lastRoute = null; view.showRoute(null); view.setMarker('dest', null); $('#routeCard').hidden = true; $('#searchCard').hidden = false; floorBtns.forEach(b => b.querySelector('.has').hidden = true); renderResults(); view.fitFloor(view.floor); };
+$('#accessible').onchange = () => recompute(false);
+
+function recompute(fly) {
+  if (!S.start || (S.mode === 'room' && !S.destRoom)) return;
+  const opts = { noStairs: $('#accessible').checked && S.mode !== 'sos', noLifts: S.mode === 'sos' };
+  let targets, title;
+  if (S.mode === 'sos') { targets = M.points.filter(p => p.kind === 'exit').map(p => p.node); title = 'ทางออกที่ใกล้ที่สุด'; }
+  else { targets = S.destCandidates.map(id => G.roomById.get(id).node); }
+  const res = route(G, S.start, targets, opts);
+  if (!res) { toast(opts.noStairs ? 'ไม่พบเส้นทางที่ไม่ใช้บันได' : 'ไม่พบเส้นทาง'); return; }
+  const endNode = G.nodes.get(res.path[res.path.length - 1]);
+  let destName;
+  if (S.mode === 'sos') { const p = M.points.find(x => x.node === endNode.id); destName = p.nameTh; }
+  else { const r = G.roomById.get(endNode.room); S.destRoom = r.id; destName = r.nameTh; }
+  const d = describe(G, res.path, opts);
+  d.steps.push({ ic: S.mode === 'sos' ? '✓' : '●', end: true, text: S.mode === 'sos' ? `ถึง${destName} ออกจากอาคารแล้วไปยังจุดรวมพล` : `ถึงปลายทาง: ${destName}`, sub: G.floors.get(endNode.floor).nameTh, floor: endNode.floor, x: endNode.x, z: endNode.z });
+  S.lastRoute = { res, d };
+  view.setMarker('dest', endNode, S.mode === 'sos' ? 'ทางออก' : destName);
+  view.showRoute(res.path.map(id => G.nodes.get(id)));
+  floorBtns.forEach((b, k) => b.querySelector('.has').hidden = !d.floors.includes(k));
+  // panel
+  $('#searchCard').hidden = true; $('#routeCard').hidden = false; $('#sosWarn').hidden = S.mode !== 'sos';
+  $('#routeKind').textContent = S.mode === 'sos' ? 'เส้นทางหนีไฟจาก' + (S.startName ? ' ' + S.startName : '') : `เส้นทางจาก ${S.startName || 'จุดเริ่มต้น'} ไป`;
+  $('#destName').textContent = destName;
+  $('#sDist').textContent = `${Math.round(d.meters)} ม.`; $('#sTime').textContent = `${Math.max(1, Math.round(d.seconds / 60))} นาที`;
+  $('#sFloors').textContent = d.floors.map(f => G.floors.get(f).short).join(' → ');
+  $('#accessible').closest('label').hidden = S.mode === 'sos';
+  $('#steps').innerHTML = d.steps.map((s, i) => `<li data-i="${i}" tabindex="0"><span class="ic ${s.v ? 'v' : ''} ${s.end ? (S.mode === 'sos' ? 'exit' : 'end') : ''}" aria-hidden="true">${s.ic}</span><span>${esc(s.text)}${s.sub ? `<small>${esc(s.sub)}</small>` : ''}</span></li>`).join('');
+  document.querySelectorAll('#steps li').forEach(li => { const go = () => { const s = d.steps[+li.dataset.i]; const fl = s.to && li.dataset.i !== '0' ? s.floor : s.floor; view.setFloor(fl); view.fit({ x0: s.x - 12, x1: s.x + 12, z0: s.z - 10, z1: s.z + 10 }); }; li.onclick = go; li.onkeydown = e => { if (e.key === 'Enter') go(); }; });
+  $('#routeNote').textContent = `${opts.noStairs ? 'คำนวณที่ความเร็วรถเข็น 0.8 ม./วินาที' : 'คำนวณที่ความเร็วเดิน 1.2 ม./วินาที'}${d.steps.some(s => s.v && /ลิฟต์/.test(s.text)) ? ' รวมเวลารอลิฟต์ประมาณ 45 วินาที' : ''}`;
+  // camera: show the start floor with the route on it
+  const sf = G.nodes.get(S.start).floor; view.setFloor(sf);
+  if (fly !== false) {
+    const pts = res.path.map(id => G.nodes.get(id)).filter(n => n.floor === sf), xs = pts.map(n => n.x), zs = pts.map(n => n.z);
+    view.fit({ x0: Math.min(...xs) - 6, x1: Math.max(...xs) + 6, z0: Math.min(...zs) - 6, z1: Math.max(...zs) + 6 });
+  }
+  bumpIdle();
+}
+
+// kiosk mode
+function bumpIdle() { if (!S.kiosk) return; clearTimeout(bumpIdle.h); bumpIdle.h = setTimeout(() => { $('#clear').click(); $('#q').value = ''; renderResults(); setStartKiosk(S.kiosk); }, CONFIG.idleResetSec * 1000); }
+if (S.kiosk) {
+  document.body.classList.add('kiosk-mode'); $('#startBox').hidden = true;
+  const k = kiosks.find(x => x.id === S.kiosk); $('#kioskHere').hidden = false; $('#kioskHere').textContent = `คุณอยู่ที่: ${k.nameTh} (${G.floors.get(k.floor).nameTh})`;
+  ['pointerdown', 'keydown'].forEach(ev => addEventListener(ev, bumpIdle));
+}
+setStartKiosk(S.kiosk || 'K1');
+renderResults();
+view.fitFloor(view.floor, false);
+window.__map = { G, S, view, goTo, goSOS, route };
+</script>
+</body>
+</html>
