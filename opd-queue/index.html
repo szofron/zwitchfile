@@ -1,0 +1,1998 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OPD Queue 3D — Quality Center Demo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Thai:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!--
+================================================================================
+ OPD QUEUE & CROWD-DENSITY 3D DEMO  (single file, no build step)
+================================================================================
+ PLAN
+  Sections in the module script:
+    1. CONFIG      – every tunable number (volumes, curves, %s, thresholds, clinics, rules)
+    2. LAYOUT      – floor-plan JSON (schema documented there) + pure geometry helpers
+    3. I18N        – every Thai UI string
+    4. SIM ENGINE  – seeded RNG + discrete-event simulation of one whole day
+    5. DATA ADAPTER– SimulatedAdapter (implemented) / ApiAdapter (stub). UI + renderer read ONLY this.
+    6. DENSITY & ALERTS – level rule, hysteresis, rule-based suggestions
+    7. SCENE / RENDERER – Three.js isometric scene, instanced agents/chairs, labels
+    8. UI OVERLAY  – DOM panels per mode
+    9. MODES       – time controller (live/replay), command / tv / mobile wiring
+   10. DEBUG       – FPS, seed, forced surge, determinism + KPI self-tests
+
+  Data shapes (see section 5 for the full contract):
+    Snapshot = { simTime, date, mode, agents[], stageCounts{scope:{stage:{waiting,service}}},
+                 clinicStats{clinicId:{...}}, stationStats{stationId:{...}}, er{...},
+                 kpis{scope:{...}}, recentCalls[] }      scope = 'ALL' | building id
+    Agent    = { id, queueNo, clinicId, building, stage, stationId, state:'walk'|'wait'|'service'|'exit',
+                 seat, line, server, fromStationId, fromServer, walkT, waitMin, rank }
+
+ ASSUMPTIONS (spec was ambiguous here; simplest consistent choice taken)
+  - The repo already has an unrelated root index.html (file converter), so this demo lives in
+    /opd-queue/index.html.
+  - Screening, vital signs and doctor are per clinic. Lab/X-ray, cashier and both pharmacy lanes
+    are shared per building (one set per OPD building), which is how most Thai OPD buildings work.
+  - Walking time between stages is counted as waiting at the next stage (patient is "in the queue"
+    as soon as they leave the previous point); it is animated for CONFIG.flow.walkMin sim-minutes.
+  - Doctors start at 08:00; half of the exam rooms close 12:00–13:00. Other points open 07:00.
+    Rooms keep serving until the queue is empty (no hard close).
+  - Weekends/holidays: weekend volume = CONFIG.volume.weekendFactor of a weekday. No holiday calendar.
+  - Seats are assigned at queue entry (lowest free seat). Overflow patients stand in a line and take
+    the next seat that frees up.
+  - Density "waiting" = patients queued at a stage (incl. walking to it); in-service patients are not
+    counted against seats.
+  - Clinic level = worst level of its own stages (screen, vitals, doctor-wait). Shared stages have
+    their own levels and alerts. ER is a separate block and never counted in OPD KPIs.
+  - Throughput/hr = patients finishing the doctor stage (clinic) / leaving the building (KPI) in the
+    previous 60 sim-minutes.
+  - Picking today's date returns to LIVE; future dates are rejected. Replay starts at 08:00, x10.
+  - TV mode outside service hours shows "นอกเวลาทำการ" and auto-loops the last service day as replay.
+  - Reduced motion: no pulsing, slower TV tour, camera jumps instead of flying.
+  - Rendering caps agents at CONFIG.render.maxAgents with a stable per-patient rank (selected
+    building first); KPIs always use full counts.
+  - Debug-only URL param ?clock=HH:MM fakes the live wall-clock (for demos/tests outside hours).
+  - Optional ?layout=<url-to-json> loads a different floor plan without code changes.
+================================================================================
+-->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+  :root {
+    --bg: #eef2f1;
+    --card: #ffffff;
+    --ink: #1f2d3a;
+    --muted: #6b7a88;
+    --line: #e3e8ec;
+    --accent: #1f8fb8;
+    --accent-soft: #e3f3f9;
+    --green: #2e9e5b;
+    --yellow: #d39b00;
+    --red: #d6374a;
+    --shadow: 0 6px 24px rgba(31, 45, 58, .10), 0 1px 3px rgba(31, 45, 58, .06);
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font-family: "Noto Sans Thai", "Sarabun", system-ui, sans-serif; font-size: 14px; }
+  body { overflow: hidden; }
+  button, select, input { font-family: inherit; font-size: inherit; color: inherit; }
+  button { cursor: pointer; }
+  #scene { position: fixed; inset: 0; }
+  #scene canvas { display: block; }
+  .card { background: var(--card); border-radius: var(--radius); box-shadow: var(--shadow); }
+  .muted { color: var(--muted); }
+  .hidden { display: none !important; }
+
+  /* --- persistent badge --- */
+  #simBadge { position: fixed; z-index: 50; top: 10px; left: 50%; transform: translateX(-50%);
+    background: #fff7e0; color: #7a5600; border: 1px solid #f1d58a; border-radius: 999px;
+    padding: 4px 14px; font-weight: 600; font-size: 13px; box-shadow: var(--shadow); white-space: nowrap; pointer-events: none; }
+
+  /* --- command mode --- */
+  #topbar { position: fixed; top: 46px; left: 12px; right: 12px; display: flex; gap: 10px; align-items: center;
+    padding: 8px 12px; z-index: 10; flex-wrap: wrap; }
+  #topbar h1 { font-size: 16px; margin: 0 6px 0 0; font-weight: 700; }
+  #topbar .sub { font-size: 12px; }
+  .seg { display: inline-flex; background: #f1f4f6; border-radius: 10px; padding: 3px; gap: 2px; }
+  .seg button { border: 0; background: transparent; padding: 5px 10px; border-radius: 8px; font-weight: 500; }
+  .seg button.on { background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.12); color: var(--accent); }
+  .pill { display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 10px; font-weight: 600; font-size: 12px; }
+  .pill.live { background: #e5f6ec; color: var(--green); }
+  .pill.replay { background: #eceafd; color: #5a4bd1; }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+  .pill.live .dot { animation: blink 1.4s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+  select, input[type=text] { border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; background: #fff; }
+  .btn { border: 1px solid var(--line); background: #fff; border-radius: 8px; padding: 5px 12px; font-weight: 600; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .spacer { flex: 1; }
+  #clock { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+  #leftCol { position: fixed; top: 112px; left: 12px; bottom: 12px; width: 268px; z-index: 9; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
+  #leftCol > * { pointer-events: auto; }
+  #kpiPanel { padding: 12px 14px; overflow: auto; flex: 0 1 auto; min-height: 120px; }
+  #kpiPanel h2, #alertPanel h2 { font-size: 14px; margin: 0 0 8px; }
+  .kgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 10px; }
+  .kbox { background: #f6f8fa; border-radius: 10px; padding: 7px 9px; }
+  .kbox .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .kbox .l { font-size: 11.5px; color: var(--muted); line-height: 1.3; }
+  table.stages { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.stages td { padding: 3px 2px; border-bottom: 1px solid var(--line); }
+  table.stages td.n { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+
+  #alertPanel { position: fixed; top: 112px; right: 12px; width: 300px; padding: 12px 14px; z-index: 9; max-height: calc(100% - 240px); overflow: auto; }
+  .alert { border-left: 4px solid var(--red); background: #fdf1f2; border-radius: 8px; padding: 7px 9px; margin-bottom: 7px; cursor: pointer; }
+  .alert .t { font-weight: 700; }
+  .alert .b { font-size: 12.5px; }
+  .sugg { border-left: 4px solid var(--accent); background: var(--accent-soft); border-radius: 8px; padding: 7px 9px; margin-bottom: 7px; font-size: 12.5px; }
+  .empty { font-size: 12.5px; color: var(--muted); padding: 6px 0; }
+
+  #legend { padding: 10px 12px; font-size: 12px; flex: none; }
+  #legend .cols { display: grid; grid-template-columns: 1fr 1fr; column-gap: 6px; }
+  #legend .row { display: flex; align-items: center; margin: 2px 0; }
+  #legend .ring { width: 12px; height: 12px; border: 3px solid var(--red); border-radius: 50%; margin-right: 6px; }
+
+  #timebar { position: fixed; bottom: 12px; left: 292px; right: 324px; padding: 8px 12px; z-index: 9;
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  #timebar .grp { display: flex; gap: 6px; align-items: center; }
+  #slider { flex: 1; min-width: 160px; accent-color: var(--accent); }
+  #replayCtl { flex: 1; min-width: 300px; }
+
+  #detail { position: fixed; right: 324px; top: 112px; width: 330px; padding: 12px 14px; z-index: 11; }
+  #detail h3 { margin: 0 0 2px; font-size: 16px; }
+  #detail .close { position: absolute; right: 8px; top: 6px; border: 0; background: none; font-size: 20px; color: var(--muted); }
+
+  .lvl { display: inline-flex; gap: 4px; align-items: center; font-weight: 700; }
+  .lvl.l0 { color: var(--green); } .lvl.l1 { color: var(--yellow); } .lvl.l2 { color: var(--red); }
+
+  #ooh { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 20; pointer-events: none; }
+  #ooh .card { padding: 22px 28px; text-align: center; pointer-events: auto; max-width: 420px; }
+  #ooh h2 { margin: 0 0 6px; font-size: 22px; }
+
+  #toast { position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%); background: #263442; color: #fff;
+    padding: 8px 16px; border-radius: 10px; z-index: 60; opacity: 0; transition: opacity .25s; pointer-events: none; }
+  #toast.show { opacity: 1; }
+
+  /* --- 3D labels --- */
+  .lbl { background: rgba(255,255,255,.94); border-radius: 8px; padding: 2px 8px; font-size: 12px; font-weight: 600;
+    box-shadow: 0 2px 8px rgba(0,0,0,.12); white-space: nowrap; pointer-events: none; color: var(--ink); }
+  .lbl.small { font-size: 10.5px; font-weight: 500; padding: 1px 6px; background: rgba(255,255,255,.85); }
+  .lbl.bld { font-size: 15px; font-weight: 700; background: #1f2d3a; color: #fff; }
+  .lbl .lv { margin-left: 6px; }
+  .lbl.red { box-shadow: 0 0 0 2px var(--red), 0 2px 8px rgba(0,0,0,.12); }
+  .lbl.red.pulse { animation: lpulse 1.2s infinite; }
+  @keyframes lpulse { 50% { box-shadow: 0 0 0 5px rgba(214,55,74,.35), 0 2px 8px rgba(0,0,0,.12); } }
+  .zoomed-out .lbl.small, .zoomed-out .lbl.station { display: none; }
+
+  /* --- debug --- */
+  #debug { position: fixed; right: 12px; bottom: 12px; width: 300px; padding: 10px 12px; z-index: 30; font-size: 12px; }
+  #debug .fps { font-size: 18px; font-weight: 700; }
+  #debug .surges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  #debug .surges button { font-size: 11px; padding: 3px 6px; }
+
+  /* --- TV mode --- */
+  body.tv { font-size: 32px; cursor: none; }
+  body.tv #simBadge { font-size: 24px; top: 14px; padding: 6px 22px; }
+  #tvHeader { position: fixed; top: 70px; left: 24px; padding: 14px 24px; z-index: 9; }
+  #tvHeader .t { font-size: 34px; font-weight: 700; }
+  #tvHeader .c { font-size: 56px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  #tvBoard { position: fixed; top: 70px; right: 24px; width: 440px; padding: 16px 22px; z-index: 9; }
+  #tvBoard .r { display: flex; justify-content: space-between; align-items: baseline; padding: 4px 0; border-bottom: 1px solid var(--line); font-size: 32px; }
+  #tvBoard .r b { font-size: 40px; font-variant-numeric: tabular-nums; }
+  #tvFocus { position: fixed; left: 24px; bottom: 120px; padding: 16px 24px; z-index: 9; min-width: 520px; }
+  #tvFocus .n { font-size: 44px; font-weight: 700; }
+  #tvFocus .s { font-size: 32px; }
+  #ticker { position: fixed; left: 0; right: 0; bottom: 0; height: 96px; background: #1f2d3a; color: #fff; z-index: 9;
+    overflow: hidden; display: flex; align-items: center; font-size: 40px; font-weight: 600; }
+  #ticker .lab { background: var(--accent); height: 100%; display: flex; align-items: center; padding: 0 24px; flex: none; z-index: 2; }
+  #ticker .track { white-space: nowrap; padding-left: 100%; animation: tick 40s linear infinite; }
+  #ticker .track span { margin-right: 80px; }
+  @keyframes tick { to { transform: translateX(-100%); } }
+  body.tv .lbl { font-size: 22px; }
+  body.tv .lbl.small { display: none; }
+  body.tv #ooh { align-items: flex-end; justify-content: flex-end; padding: 0 24px 120px 0; }
+  body.tv #ooh .card { max-width: 820px; } body.tv #ooh h2 { font-size: 40px; }
+  body.mobile .lbl:not(.clinic) { display: none; }
+  body.mobile .lbl { font-size: 10px; }
+
+  /* --- mobile mode --- */
+  body.mobile { overflow: auto; background: #f4f7f8; }
+  body.mobile #scene { position: relative; inset: auto; height: 220px; border-radius: 14px; overflow: hidden; margin: 10px 0; }
+  body.mobile #simBadge { position: sticky; top: 0; left: 0; transform: none; display: block; text-align: center; border-radius: 0; font-size: 12.5px; white-space: normal; }
+  #mob { max-width: 520px; margin: 0 auto; padding: 12px 14px 40px; }
+  #mob h1 { font-size: 20px; margin: 6px 0 2px; }
+  #mob .card { padding: 14px; margin-top: 12px; }
+  #mob .inrow { display: flex; gap: 8px; }
+  #mob .inrow input { flex: 1; min-width: 0; font-size: 18px; padding: 10px 12px; text-transform: uppercase; }
+  #mob .inrow button { font-size: 16px; padding: 10px 14px; }
+  #mob .big { font-size: 40px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  #mob .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+  #mob .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  #mob .chips button { border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 4px 10px; font-size: 13px; }
+  #mob .steps { display: flex; gap: 4px; margin-top: 10px; flex-wrap: wrap; }
+  #mob .steps span { font-size: 11.5px; padding: 3px 7px; border-radius: 6px; background: #eef2f4; color: var(--muted); }
+  #mob .steps span.done { background: #e5f6ec; color: var(--green); }
+  #mob .steps span.cur { background: var(--accent); color: #fff; font-weight: 700; }
+  body.mobile #ooh { position: static; display: block; }
+  body.mobile #ooh .card { max-width: none; margin-top: 12px; }
+
+  @media (max-width: 1100px) {
+    body:not(.tv):not(.mobile) #alertPanel { width: 240px; }
+    body:not(.tv):not(.mobile) #timebar { left: 12px; right: 12px; bottom: 150px; }
+    body:not(.tv):not(.mobile) #detail { right: 12px; top: auto; bottom: 230px; }
+  }
+</style>
+</head>
+<body>
+<div id="scene"></div>
+<div id="ui"></div>
+<div id="simBadge"></div>
+<div id="toast"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// ===== 1. CONFIG =====
+// Every tunable number lives here. Times are minutes since midnight (Asia/Bangkok).
+const CONFIG = {
+  timezone: 'Asia/Bangkok',
+  day: { open: 420, close: 1020, arrivalsStart: 420, arrivalsEnd: 960 },   // 07:00–17:00, arrivals until 16:00
+  volume: { visitsPerDay: 3000, dailyJitter: 0.06, weekendFactor: 0.2 },
+  // Relative arrival weight per 30-min slot starting 07:00 (18 slots → 16:00).
+  // Main peak 08:00–10:30, secondary 13:00–14:00, tapering to close.
+  arrivalCurve: [4, 7, 10, 11, 11, 10, 8.5, 5.5, 4, 3, 2.5, 3.5, 6, 6, 3.5, 2.2, 1.4, 0.8],
+  flow: {
+    pLabDefault: 0.30,      // share of patients sent to lab/X-ray after the doctor
+    pNoMed: 0.15,           // share with no medication → exit after cashier
+    pHomeDelivery: 0.20,    // share of medicated patients choosing home delivery
+    walkMin: 1.0,           // sim-minutes of walking animation into each queue
+    exitWalkMin: 1.5
+  },
+  shifts: { doctorStart: 480, lunchStart: 720, lunchEnd: 780, lunchOffEvery: 2 }, // every 2nd room off at lunch
+  // Default service time per stage {mean, sd} minutes (spec ranges: screening 2–3, vitals 3–5,
+  // doctor 8–15, lab/X-ray 10–20, cashier 2–4, pharmacy 10–20). Clinics/buildings may override.
+  serviceMin: {
+    screen: { mean: 2.5, sd: 0.35 }, vitals: { mean: 4, sd: 0.6 }, doctor: { mean: 11.5, sd: 2.4 },
+    lab: { mean: 15, sd: 3 }, cashier: { mean: 3, sd: 0.5 }, pharmHosp: { mean: 15, sd: 3 }, pharmHome: { mean: 6, sd: 1.5 }
+  },
+  serviceClamp: [0.5, 2.0],  // sampled time clamped to [mean*0.5, mean*2]
+  // Density thresholds: green occ<60% AND wait<30 | yellow 60–85% OR 30–60 | red >85% OR >60
+  density: { occYellow: 0.60, occRed: 0.85, waitYellow: 30, waitRed: 60, hysteresisMin: 3 },
+  render: { maxAgents: 500, shadowMapSize: 2048, maxPixelRatio: 2, frustumH: 120,
+            tourSec: 12, tourSecReduced: 24, flyMs: 1100, uiHz: 4, labelZoomMin: 0.9 },
+  replay: { speeds: [1, 10, 30, 60], defaultSpeed: 10, startMin: 480, minYearsBack: 2 },
+  stageOrder: ['screen', 'vitals', 'doctor', 'lab', 'cashier', 'pharmHosp', 'pharmHome'],
+  clinicStages: ['screen', 'vitals', 'doctor'],
+  sharedStages: ['lab', 'cashier', 'pharmHosp', 'pharmHome'],
+  stageColors: { screen: '#7c6cf0', vitals: '#f08a3c', doctor: '#2f8fd8', lab: '#c04fc2',
+                 cashier: '#e0b400', pharmHosp: '#22a67a', pharmHome: '#14b8c4', er: '#e04848', exit: '#9aa5ae' },
+  levelColors: ['#2e9e5b', '#e0a800', '#d6374a'],
+  sceneColors: { ground: '#e6ece8', slab: '#fbfbf9', wall: '#ffffff', wallLow: '#f3f3f1', counter: '#dfe7ec',
+                 clinicFloor: '#f9e1e6', clinicFloorAlt: '#fdeff2', sharedFloor: '#eef6f3', pharmFloor: '#e9f4fb',
+                 erFloor: '#fde8e3', booth: '#ffffff', chair: '#3a9cc4', leaf: '#6fbf5b', leaf2: '#8fd16f', trunk: '#9a7350', bed: '#d9e8f0' },
+  // Rule-based suggestions (Command Center only). No generated text: each maps to an I18N key.
+  rules: [
+    { id: 'clinicRedLong', target: 'clinic', level: 2, minDurationMin: 10, textKey: 'sugOpenRoom' },
+    { id: 'screenRed',     target: 'stage', stage: 'screen', level: 2, minDurationMin: 0, textKey: 'sugScreen' },
+    { id: 'vitalsRed',     target: 'stage', stage: 'vitals', level: 2, minDurationMin: 0, textKey: 'sugVitals' },
+    { id: 'labRed',        target: 'stage', stage: 'lab', level: 2, minDurationMin: 5, textKey: 'sugLab' },
+    { id: 'cashierRed',    target: 'stage', stage: 'cashier', level: 2, minDurationMin: 5, textKey: 'sugCashier' },
+    { id: 'pharmWait',     target: 'stage', stage: 'pharmHosp', avgWaitGt: 45, textKey: 'sugHomeDelivery' },
+    { id: 'erRed',         target: 'er', level: 2, minDurationMin: 5, textKey: 'sugER' }
+  ],
+  debug: { surgePatients: 70, surgeSpreadMin: 4 },
+  // ER: separate block, own density; not part of OPD flow.
+  er: { visitsPerDay: 170, beds: 22, service: { mean: 75, sd: 35 }, prefix: 'ER',
+        curve: [3, 4, 5, 6, 6, 6, 6, 5, 5, 5, 5, 6, 6, 6, 5, 5, 4, 4, 4, 4] },  // 30-min slots 07:00–17:00
+  // Shared services per building: counters (= parallel service points) and default seats.
+  buildings: [
+    { id: 'OPD1', nameTh: 'อาคารผู้ป่วยนอก 1', counters: { lab: 14, cashier: 10, pharmHosp: 28, pharmHome: 4 },
+      seats: { lab: 48, cashier: 50, pharmHosp: 150, pharmHome: 40 } },
+    { id: 'OPD2', nameTh: 'อาคารผู้ป่วยนอก 2', counters: { lab: 13, cashier: 10, pharmHosp: 26, pharmHome: 4 },
+      seats: { lab: 48, cashier: 50, pharmHosp: 150, pharmHome: 40 } },
+    { id: 'OPD3', nameTh: 'อาคารผู้ป่วยนอก 3', counters: { lab: 5, cashier: 8, pharmHosp: 22, pharmHome: 4 },
+      seats: { lab: 48, cashier: 50, pharmHosp: 150, pharmHome: 40 } }
+  ],
+  // Clinics: share = fraction of daily visits; roomCount = doctor exam rooms; counters = screening/vitals points.
+  // seats = fallback if the LAYOUT room has no seats; service = per-stage {mean, sd} overrides.
+  clinics: [
+    { id: 'MED', nameTh: 'อายุรกรรม',        prefix: 'MED', building: 'OPD1', share: 0.22, roomCount: 22, counters: { screen: 6, vitals: 9 },
+      seats: { screen: 30, vitals: 36, doctor: 120 }, pLab: 0.45, service: {} },
+    { id: 'PED', nameTh: 'กุมารเวชกรรม',     prefix: 'PED', building: 'OPD1', share: 0.10, roomCount: 10, counters: { screen: 3, vitals: 4 },
+      seats: { screen: 24, vitals: 28, doctor: 60 }, pLab: 0.25, service: { doctor: { mean: 10, sd: 2 } } },
+    { id: 'PSY', nameTh: 'จิตเวช',            prefix: 'PSY', building: 'OPD1', share: 0.05, roomCount: 9, counters: { screen: 2, vitals: 2 },
+      seats: { screen: 16, vitals: 20, doctor: 40 }, pLab: 0.05, service: { doctor: { mean: 20, sd: 4 } } },
+    { id: 'SUR', nameTh: 'ศัลยกรรม',          prefix: 'SUR', building: 'OPD2', share: 0.12, roomCount: 13, counters: { screen: 3, vitals: 5 },
+      seats: { screen: 24, vitals: 28, doctor: 70 }, pLab: 0.35, service: {} },
+    { id: 'ORT', nameTh: 'ออร์โธปิดิกส์',      prefix: 'ORT', building: 'OPD2', share: 0.12, roomCount: 12, counters: { screen: 3, vitals: 5 },
+      seats: { screen: 24, vitals: 28, doctor: 70 }, pLab: 0.40, service: { doctor: { mean: 10, sd: 2 } } },
+    { id: 'OBG', nameTh: 'สูติ-นรีเวชกรรม',    prefix: 'OBG', building: 'OPD2', share: 0.10, roomCount: 11, counters: { screen: 3, vitals: 4 },
+      seats: { screen: 20, vitals: 24, doctor: 60 }, pLab: 0.30, service: {} },
+    { id: 'EYE', nameTh: 'จักษุ',             prefix: 'EYE', building: 'OPD3', share: 0.11, roomCount: 10, counters: { screen: 3, vitals: 4 },
+      seats: { screen: 24, vitals: 28, doctor: 70 }, pLab: 0.10, service: { doctor: { mean: 9, sd: 2 } } },
+    { id: 'ENT', nameTh: 'โสต ศอ นาสิก',       prefix: 'ENT', building: 'OPD3', share: 0.09, roomCount: 9, counters: { screen: 3, vitals: 4 },
+      seats: { screen: 20, vitals: 24, doctor: 60 }, pLab: 0.15, service: { doctor: { mean: 10, sd: 2 } } },
+    { id: 'DEN', nameTh: 'ทันตกรรม',          prefix: 'DEN', building: 'OPD3', share: 0.09, roomCount: 13, counters: { screen: 3, vitals: 3 },
+      seats: { screen: 20, vitals: 20, doctor: 50 }, pLab: 0.10, service: { doctor: { mean: 15, sd: 3 } } }
+  ]
+};
+
+// ===== 2. LAYOUT =====
+/*
+  LAYOUT JSON SCHEMA (units = metres; replace the object below, or load ?layout=<url>.json)
+  {
+    "units": "m",
+    "buildings": [ {                       // one floor plate per building (no stacked floors)
+        "id": "OPD1",                      // must match CONFIG.buildings[].id (or "ER")
+        "x": 0, "z": 0,                    // world centre of the plate
+        "w": 72, "d": 50,                  // size along x / z
+        "corridorZ": 3.8,                  // local z of the main corridor (walking paths use it)
+        "entrance": {"x":-20,"z":25},      // local door positions (front edge is +z)
+        "exit": {"x":25,"z":25} } ],
+    "rooms": [ {
+        "id": "OPD1-MED-doctor",           // unique; used as the station id
+        "building": "OPD1",
+        "type": "doctor",                  // screen|vitals|doctor|lab|cashier|pharmHosp|pharmHome|er
+        "clinicId": "MED",                 // clinic for screen/vitals/doctor, null for shared, "ER" for er
+        "x": -20.5, "z": -16.5,            // local centre of the zone
+        "w": 29, "d": 15,                  // zone size; service points line the back (−z) edge
+        "seats": 120,                      // physical waiting chairs (used for occupancy)
+        "label": "" } ],                   // optional label override (else name from CONFIG/I18N)
+    "decor": [ { "type": "tree", "building": "OPD1", "x": -41, "z": -20 } ]
+  }
+  Rules: every clinic in CONFIG needs screen/vitals/doctor rooms; every OPD building needs
+  lab/cashier/pharmHosp/pharmHome rooms; ER needs one "er" room. Number of service points
+  drawn = CONFIG counters/roomCount. Chairs fill the zone in front of the service points.
+*/
+const DEFAULT_LAYOUT = {
+  "units": "m",
+  "buildings": [
+    {"id":"OPD1","x":0,"z":0,"w":72,"d":50,"corridorZ":3.8,"entrance":{"x":-20,"z":25},"exit":{"x":25,"z":25}},
+    {"id":"OPD2","x":68,"z":-68,"w":72,"d":50,"corridorZ":3.8,"entrance":{"x":-20,"z":25},"exit":{"x":25,"z":25}},
+    {"id":"OPD3","x":136,"z":-136,"w":72,"d":50,"corridorZ":3.8,"entrance":{"x":-20,"z":25},"exit":{"x":25,"z":25}},
+    {"id":"ER","x":-30,"z":64,"w":36,"d":32,"corridorZ":9,"entrance":{"x":-6,"z":16},"exit":{"x":8,"z":16}}
+  ],
+  "rooms": [
+    {"id":"OPD1-MED-doctor","building":"OPD1","type":"doctor","clinicId":"MED","x":-20.5,"z":-16.5,"w":29,"d":15,"seats":120,"label":""},
+    {"id":"OPD1-MED-screen","building":"OPD1","type":"screen","clinicId":"MED","x":-28.7,"z":-2.5,"w":12.6,"d":10,"seats":30,"label":""},
+    {"id":"OPD1-MED-vitals","building":"OPD1","type":"vitals","clinicId":"MED","x":-13.7,"z":-2.5,"w":15.4,"d":10,"seats":36,"label":""},
+    {"id":"OPD1-PED-doctor","building":"OPD1","type":"doctor","clinicId":"PED","x":5.5,"z":-16.5,"w":20,"d":15,"seats":60,"label":""},
+    {"id":"OPD1-PED-screen","building":"OPD1","type":"screen","clinicId":"PED","x":-0.2,"z":-2.5,"w":8.5,"d":10,"seats":24,"label":""},
+    {"id":"OPD1-PED-vitals","building":"OPD1","type":"vitals","clinicId":"PED","x":10.3,"z":-2.5,"w":10.5,"d":10,"seats":28,"label":""},
+    {"id":"OPD1-PSY-doctor","building":"OPD1","type":"doctor","clinicId":"PSY","x":26,"z":-16.5,"w":18,"d":15,"seats":40,"label":""},
+    {"id":"OPD1-PSY-screen","building":"OPD1","type":"screen","clinicId":"PSY","x":20.8,"z":-2.5,"w":7.6,"d":10,"seats":16,"label":""},
+    {"id":"OPD1-PSY-vitals","building":"OPD1","type":"vitals","clinicId":"PSY","x":30.3,"z":-2.5,"w":9.4,"d":10,"seats":20,"label":""},
+    {"id":"OPD1-lab","building":"OPD1","type":"lab","clinicId":null,"x":-27,"z":12.5,"w":16,"d":14,"seats":48,"label":""},
+    {"id":"OPD1-cashier","building":"OPD1","type":"cashier","clinicId":null,"x":-11.7,"z":12.5,"w":12,"d":14,"seats":50,"label":""},
+    {"id":"OPD1-pharmHosp","building":"OPD1","type":"pharmHosp","clinicId":null,"x":9.6,"z":12.5,"w":28,"d":14,"seats":150,"label":""},
+    {"id":"OPD1-pharmHome","building":"OPD1","type":"pharmHome","clinicId":null,"x":29.9,"z":12.5,"w":10,"d":14,"seats":40,"label":""},
+    {"id":"OPD2-SUR-doctor","building":"OPD2","type":"doctor","clinicId":"SUR","x":-23.5,"z":-16.5,"w":23,"d":15,"seats":70,"label":""},
+    {"id":"OPD2-SUR-screen","building":"OPD2","type":"screen","clinicId":"SUR","x":-30,"z":-2.5,"w":9.9,"d":10,"seats":24,"label":""},
+    {"id":"OPD2-SUR-vitals","building":"OPD2","type":"vitals","clinicId":"SUR","x":-18,"z":-2.5,"w":12.1,"d":10,"seats":28,"label":""},
+    {"id":"OPD2-ORT-doctor","building":"OPD2","type":"doctor","clinicId":"ORT","x":1,"z":-16.5,"w":23,"d":15,"seats":70,"label":""},
+    {"id":"OPD2-ORT-screen","building":"OPD2","type":"screen","clinicId":"ORT","x":-5.5,"z":-2.5,"w":9.9,"d":10,"seats":24,"label":""},
+    {"id":"OPD2-ORT-vitals","building":"OPD2","type":"vitals","clinicId":"ORT","x":6.5,"z":-2.5,"w":12.1,"d":10,"seats":28,"label":""},
+    {"id":"OPD2-OBG-doctor","building":"OPD2","type":"doctor","clinicId":"OBG","x":24.5,"z":-16.5,"w":21,"d":15,"seats":60,"label":""},
+    {"id":"OPD2-OBG-screen","building":"OPD2","type":"screen","clinicId":"OBG","x":18.5,"z":-2.5,"w":9,"d":10,"seats":20,"label":""},
+    {"id":"OPD2-OBG-vitals","building":"OPD2","type":"vitals","clinicId":"OBG","x":29.5,"z":-2.5,"w":11,"d":10,"seats":24,"label":""},
+    {"id":"OPD2-lab","building":"OPD2","type":"lab","clinicId":null,"x":-27,"z":12.5,"w":16,"d":14,"seats":48,"label":""},
+    {"id":"OPD2-cashier","building":"OPD2","type":"cashier","clinicId":null,"x":-11.7,"z":12.5,"w":12,"d":14,"seats":50,"label":""},
+    {"id":"OPD2-pharmHosp","building":"OPD2","type":"pharmHosp","clinicId":null,"x":9.6,"z":12.5,"w":28,"d":14,"seats":150,"label":""},
+    {"id":"OPD2-pharmHome","building":"OPD2","type":"pharmHome","clinicId":null,"x":29.9,"z":12.5,"w":10,"d":14,"seats":40,"label":""},
+    {"id":"OPD3-EYE-doctor","building":"OPD3","type":"doctor","clinicId":"EYE","x":-23,"z":-16.5,"w":24,"d":15,"seats":70,"label":""},
+    {"id":"OPD3-EYE-screen","building":"OPD3","type":"screen","clinicId":"EYE","x":-29.8,"z":-2.5,"w":10.3,"d":10,"seats":24,"label":""},
+    {"id":"OPD3-EYE-vitals","building":"OPD3","type":"vitals","clinicId":"EYE","x":-17.3,"z":-2.5,"w":12.7,"d":10,"seats":28,"label":""},
+    {"id":"OPD3-ENT-doctor","building":"OPD3","type":"doctor","clinicId":"ENT","x":1.5,"z":-16.5,"w":22,"d":15,"seats":60,"label":""},
+    {"id":"OPD3-ENT-screen","building":"OPD3","type":"screen","clinicId":"ENT","x":-4.8,"z":-2.5,"w":9.4,"d":10,"seats":20,"label":""},
+    {"id":"OPD3-ENT-vitals","building":"OPD3","type":"vitals","clinicId":"ENT","x":6.7,"z":-2.5,"w":11.6,"d":10,"seats":24,"label":""},
+    {"id":"OPD3-DEN-doctor","building":"OPD3","type":"doctor","clinicId":"DEN","x":24.5,"z":-16.5,"w":21,"d":15,"seats":50,"label":""},
+    {"id":"OPD3-DEN-screen","building":"OPD3","type":"screen","clinicId":"DEN","x":18.5,"z":-2.5,"w":9,"d":10,"seats":20,"label":""},
+    {"id":"OPD3-DEN-vitals","building":"OPD3","type":"vitals","clinicId":"DEN","x":29.5,"z":-2.5,"w":11,"d":10,"seats":20,"label":""},
+    {"id":"OPD3-lab","building":"OPD3","type":"lab","clinicId":null,"x":-27,"z":12.5,"w":16,"d":14,"seats":48,"label":""},
+    {"id":"OPD3-cashier","building":"OPD3","type":"cashier","clinicId":null,"x":-11.7,"z":12.5,"w":12,"d":14,"seats":50,"label":""},
+    {"id":"OPD3-pharmHosp","building":"OPD3","type":"pharmHosp","clinicId":null,"x":9.6,"z":12.5,"w":28,"d":14,"seats":150,"label":""},
+    {"id":"OPD3-pharmHome","building":"OPD3","type":"pharmHome","clinicId":null,"x":29.9,"z":12.5,"w":10,"d":14,"seats":40,"label":""},
+    {"id":"ER-er","building":"ER","type":"er","clinicId":"ER","x":0,"z":-1,"w":33,"d":26,"seats":40,"label":""}
+  ],
+  "decor": [
+    {"type":"tree","building":"OPD1","x":-41,"z":-20},
+    {"type":"tree","building":"OPD1","x":-41,"z":0},
+    {"type":"tree","building":"OPD1","x":-41,"z":18},
+    {"type":"tree","building":"OPD1","x":41,"z":-22},
+    {"type":"tree","building":"OPD1","x":41,"z":-4},
+    {"type":"tree","building":"OPD1","x":41,"z":14},
+    {"type":"tree","building":"OPD1","x":-30,"z":30},
+    {"type":"tree","building":"OPD1","x":-4,"z":31},
+    {"type":"tree","building":"OPD1","x":10,"z":30},
+    {"type":"tree","building":"OPD1","x":34,"z":31},
+    {"type":"tree","building":"OPD2","x":-41,"z":-20},
+    {"type":"tree","building":"OPD2","x":-41,"z":0},
+    {"type":"tree","building":"OPD2","x":-41,"z":18},
+    {"type":"tree","building":"OPD2","x":41,"z":-22},
+    {"type":"tree","building":"OPD2","x":41,"z":-4},
+    {"type":"tree","building":"OPD2","x":41,"z":14},
+    {"type":"tree","building":"OPD2","x":-30,"z":30},
+    {"type":"tree","building":"OPD2","x":-4,"z":31},
+    {"type":"tree","building":"OPD2","x":10,"z":30},
+    {"type":"tree","building":"OPD2","x":34,"z":31},
+    {"type":"tree","building":"OPD3","x":-41,"z":-20},
+    {"type":"tree","building":"OPD3","x":-41,"z":0},
+    {"type":"tree","building":"OPD3","x":-41,"z":18},
+    {"type":"tree","building":"OPD3","x":41,"z":-22},
+    {"type":"tree","building":"OPD3","x":41,"z":-4},
+    {"type":"tree","building":"OPD3","x":41,"z":14},
+    {"type":"tree","building":"OPD3","x":-30,"z":30},
+    {"type":"tree","building":"OPD3","x":-4,"z":31},
+    {"type":"tree","building":"OPD3","x":10,"z":30},
+    {"type":"tree","building":"OPD3","x":34,"z":31},
+    {"type":"tree","building":"ER","x":-21,"z":-12},
+    {"type":"tree","building":"ER","x":-21,"z":6},
+    {"type":"tree","building":"ER","x":-10,"z":21},
+    {"type":"tree","building":"ER","x":14,"z":21},
+    {"type":"tree","building":"ER","x":21,"z":-14}
+  ]
+};
+const LAYOUT = (typeof window !== 'undefined' && window.OPD_LAYOUT) || DEFAULT_LAYOUT;
+
+const GEO = { boothW: 2.3, bedW: 2.05, boothD: 3.4, counterPitch: 1.45, counterDepth: 2.4,
+              seatPitchX: 0.8, seatPitchZ: 1.3, aisleEvery: 10, standStrip: 1.3, standPitch: 0.62, margin: 0.6 };
+
+/** Static topology: stations (= rooms with service points) derived from CONFIG + LAYOUT. */
+function buildTopology(config, layout) {
+  const buildings = Object.fromEntries(layout.buildings.map(b => [b.id, b]));
+  const stations = [];
+  const byKey = {};
+  const warn = (m) => (typeof console !== 'undefined') && console.warn('[layout]', m);
+  const roomFor = (b, cid, type) => layout.rooms.find(r => r.building === b && r.type === type && (cid ? r.clinicId === cid : !r.clinicId));
+  const add = (room, stage, building, clinicId, servers, seats, service) => {
+    const st = { idx: stations.length, id: room.id, stage, building, clinicId, servers, seats: room.seats ?? seats, service, room };
+    stations.push(st); byKey[`${building}|${clinicId || '-'}|${stage}`] = st; return st;
+  };
+  for (const c of config.clinics) {
+    for (const stage of config.clinicStages) {
+      const room = roomFor(c.building, c.id, stage);
+      if (!room) { warn(`missing room ${c.id}/${stage}`); continue; }
+      const servers = stage === 'doctor' ? c.roomCount : c.counters[stage];
+      add(room, stage, c.building, c.id, servers, c.seats[stage], c.service[stage] || config.serviceMin[stage]);
+    }
+  }
+  for (const b of config.buildings) {
+    for (const stage of config.sharedStages) {
+      const room = roomFor(b.id, null, stage);
+      if (!room) { warn(`missing room ${b.id}/${stage}`); continue; }
+      add(room, stage, b.id, null, b.counters[stage], b.seats[stage], (b.service && b.service[stage]) || config.serviceMin[stage]);
+    }
+  }
+  const erRoom = layout.rooms.find(r => r.type === 'er');
+  if (erRoom) add(erRoom, 'er', erRoom.building, 'ER', config.er.beds, erRoom.seats ?? 30, config.er.service);
+  const get = (building, clinicId, stage) => byKey[`${building}|${clinicId || '-'}|${stage}`];
+  return { buildings, stations, get };
+}
+
+/** Pure geometry for one room: service points, chairs and overflow standing slots (world coords). */
+function roomGeometry(room, bld, servers) {
+  const cx = bld.x + room.x, cz = bld.z + room.z;
+  const x0 = cx - room.w / 2, x1 = cx + room.w / 2, z0 = cz - room.d / 2, z1 = cz + room.d / 2;
+  const booth = room.type === 'doctor' || room.type === 'er';
+  const pitch = booth ? (room.type === 'er' ? GEO.bedW : GEO.boothW) : GEO.counterPitch;
+  const perRow = Math.max(1, Math.floor((room.w - 2 * GEO.margin) / pitch));
+  const rowsN = Math.max(1, Math.ceil(servers / perRow));
+  const rowD = booth ? GEO.boothD : GEO.counterDepth;
+  const booths = [], service = [], counters = [];
+  for (let i = 0; i < servers; i++) {
+    const r = Math.floor(i / perRow), c = i % perRow;
+    const nInRow = Math.min(perRow, servers - r * perRow);
+    const x = cx - (nInRow * pitch) / 2 + pitch / 2 + c * pitch;
+    const zb = z0 + GEO.margin * 0.5 + r * rowD;
+    if (booth) { booths.push({ x, z: zb + rowD / 2, w: pitch - 0.15, d: rowD - 0.15 }); service.push({ x, z: zb + rowD / 2 + 0.5 }); }
+    else { service.push({ x, z: zb + 1.55 }); }
+  }
+  for (let r = 0; r < (booth ? 0 : rowsN); r++) {
+    const n = Math.min(perRow, servers - r * perRow);
+    counters.push({ x: cx, z: z0 + GEO.margin * 0.5 + r * rowD + 0.55, w: n * pitch + 0.4 });
+  }
+  const serviceDepth = GEO.margin * 0.5 + rowsN * rowD + 0.5;
+  const seats = [];
+  const usableW = room.w - 2 * GEO.margin;
+  const colsRaw = Math.floor(usableW / GEO.seatPitchX);
+  const aisles = Math.floor((colsRaw - 1) / (GEO.aisleEvery + 1));
+  const cols = colsRaw - aisles;
+  const rowsS = Math.max(0, Math.floor((room.d - serviceDepth - GEO.standStrip) / GEO.seatPitchZ));
+  const span = (cols + aisles) * GEO.seatPitchX;
+  outer: for (let r = 0; r < rowsS; r++) {
+    for (let c = 0; c < cols; c++) {
+      if (seats.length >= room.seats) break outer;
+      const slot = c + Math.floor(c / GEO.aisleEvery);
+      seats.push({ x: cx - span / 2 + GEO.seatPitchX / 2 + slot * GEO.seatPitchX, z: z0 + serviceDepth + 0.5 + r * GEO.seatPitchZ });
+    }
+  }
+  const standCols = Math.max(1, Math.floor(usableW / GEO.standPitch));
+  const standing = (k) => ({ x: x0 + GEO.margin + (k % standCols) * GEO.standPitch + 0.3,
+                             z: z1 - GEO.standStrip + 0.45 + Math.floor(k / standCols) * GEO.standPitch });
+  return { cx, cz, x0, x1, z0, z1, booth, booths, counters, service, seats, standing, serviceDepth };
+}
+
+// ===== 3. I18N (Thai strings) =====
+const I18N = {
+  appTitle: 'ระบบติดตามคิวและความหนาแน่นผู้ป่วยนอก',
+  appSub: 'ศูนย์คุณภาพ · แดชบอร์ดสาธิต 3 มิติ',
+  simBadge: 'ข้อมูลจำลองเพื่อการสาธิต (Simulated data)',
+  overview: 'ภาพรวมทั้งหมด',
+  live: 'สด (LIVE)', replay: 'ย้อนหลัง (REPLAY)', now: 'ตอนนี้', search: 'ค้นหา',
+  play: '▶ เล่น', pause: '❚❚ หยุด', speed: 'ความเร็ว',
+  timeFmt: '{hh}:{mm} น.',
+  dateFmt: '{wd} {d} {m} {y}',
+  dayLabel: 'วัน', monthLabel: 'เดือน', yearLabel: 'ปี พ.ศ.',
+  months: ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'],
+  weekdays: ['วันอาทิตย์', 'วันจันทร์', 'วันอังคาร', 'วันพุธ', 'วันพฤหัสบดี', 'วันศุกร์', 'วันเสาร์'],
+  outOfHours: 'นอกเวลาทำการ',
+  outOfHoursDetail: 'เปิดให้บริการ {open}–{close} น. ขณะนี้ไม่มีข้อมูลสด',
+  viewReplay: 'ดูข้อมูลย้อนหลัง ({date})',
+  tvReplayNote: 'กำลังแสดงภาพย้อนหลัง {date}',
+  invalidDate: 'วันที่ไม่ถูกต้อง',
+  futureDate: 'ไม่มีข้อมูลของวันในอนาคต',
+  selectClinic: 'เลือกคลินิก…',
+  clinicOption: '{name} — {n} คน',
+  persons: '{n} คน',
+  minutes: '{n} นาที',
+  perHour: '{n} คน/ชม.',
+  stage: { screen: 'คัดกรอง/ลงทะเบียน', vitals: 'วัดสัญญาณชีพ', doctor: 'พบแพทย์', lab: 'แล็บ/เอกซเรย์',
+           cashier: 'การเงิน', pharmHosp: 'รับยาที่ รพ.', pharmHome: 'ยาส่งบ้าน', er: 'ฉุกเฉิน', exit: 'ออกจากอาคาร' },
+  stageWait: { screen: 'รอคัดกรอง', vitals: 'รอวัดสัญญาณชีพ', doctor: 'รอพบแพทย์', lab: 'รอแล็บ/เอกซเรย์',
+               cashier: 'รอชำระเงิน', pharmHosp: 'รอรับยาที่ รพ.', pharmHome: 'รอลงทะเบียนยาส่งบ้าน', er: 'รอตรวจฉุกเฉิน' },
+  pharmacy: 'ห้องยา',
+  erName: 'ฉุกเฉิน (ER)',
+  level: ['ปกติ', 'เฝ้าระวัง', 'แออัด'],
+  levelIcon: ['●', '▲', '◆'],
+  kpiTitle: 'ตัวชี้วัด',
+  kpiTotal: 'ผู้รับบริการในอาคาร',
+  kpiAvgWait: 'เวลารอเฉลี่ย (นาที)',
+  kpiOver: 'รอเกิน {n} นาที',
+  kpiThroughput: 'ออกจากระบบ/ชม.',
+  kpiPctRed: 'คลินิกแออัด',
+  kpiArrived: 'มารับบริการแล้ววันนี้',
+  kpiWaitingByStage: 'รอในแต่ละขั้นตอน (รอ / กำลังรับบริการ)',
+  kpiPharmSplit: 'แยกช่องทางรับยา',
+  kpiPharmNow: 'ขณะนี้',
+  kpiPharmServed: 'สะสมวันนี้',
+  alertsTitle: 'การแจ้งเตือน',
+  suggestTitle: 'ข้อเสนอแนะ (ตามกฎ)',
+  noAlerts: 'ไม่มีจุดแออัดในขณะนี้',
+  noSuggest: 'ไม่มีข้อเสนอแนะ',
+  alertClinic: '{stage}: รอ {n} คน · เฉลี่ย {w} นาที',
+  alertStage: '{bld} · รอ {n} คน · เฉลี่ย {w} นาที',
+  alertRedFor: 'แออัดต่อเนื่อง {n} นาที',
+  sugOpenRoom: '{name}: แออัดต่อเนื่อง ≥{n} นาที → พิจารณาเปิดห้องตรวจสำรอง',
+  sugScreen: '{name}: จุดคัดกรองแออัด → เพิ่มเจ้าหน้าที่คัดกรอง/ลงทะเบียน',
+  sugVitals: '{name}: คิววัดสัญญาณชีพแออัด → เปิดจุดวัด V/S เสริม',
+  sugLab: '{bld}: แล็บ/เอกซเรย์แออัด → เปิดจุดเจาะเลือดเสริม',
+  sugCashier: '{bld}: การเงินแออัด → เปิดช่องชำระเงินเพิ่ม / แนะนำชำระผ่านแอป',
+  sugHomeDelivery: '{bld}: รอรับยาเฉลี่ย {w} นาที (>45) → ประชาสัมพันธ์บริการยาส่งบ้าน',
+  sugER: 'ฉุกเฉิน: แออัด → พิจารณาเปิดพื้นที่สังเกตอาการเพิ่ม',
+  legendTitle: 'คำอธิบายสัญลักษณ์',
+  colorByStage: 'สีตามขั้นตอน',
+  colorByWait: 'สีตามเวลารอ',
+  waitBand: ['รอ < {a} นาที', 'รอ {a}–{b} นาที', 'รอ > {b} นาที'],
+  ringLegend: 'วงแดงใต้เท้า = รอเกิน {n} นาที',
+  levelLegend: 'ระดับความหนาแน่น:',
+  detailStage: 'ขั้นตอน',
+  detailWaiting: 'รอ',
+  detailService: 'รับบริการ',
+  detailOcc: 'ที่นั่ง',
+  detailWait: 'รอเฉลี่ย',
+  detailLevel: 'ระดับ',
+  detailTotal: 'ผู้ป่วยในคลินิก',
+  detailThroughput: 'ตรวจเสร็จ/ชม.',
+  detailServers: 'จุดบริการ',
+  detailBeds: 'เตียง',
+  detailRedFor: 'แออัดต่อเนื่อง',
+  shared: 'บริการร่วมของอาคาร',
+  tvCallTitle: 'เรียกคิว',
+  callDoctor: 'เชิญคิว {q} ห้องตรวจ {room}',
+  callPharm: 'เชิญคิว {q} ช่องรับยา {room}',
+  callLab: 'เชิญคิว {q} ห้องแล็บ/เอกซเรย์ {room}',
+  noCalls: 'ยังไม่มีการเรียกคิวในช่วงนี้',
+  tvWaiting: 'กำลังรอ',
+  tvAvgWait: 'รอเฉลี่ย',
+  tvRedClinics: 'คลินิกแออัด',
+  tvInBuilding: 'ในอาคาร',
+  mobTitle: 'ตรวจสอบคิวของท่าน',
+  mobSub: 'กรอกหมายเลขคิวที่ได้รับ (ไม่ต้องใช้ชื่อหรือ HN)',
+  mobPlaceholder: 'เช่น MED-023',
+  mobCheck: 'ตรวจสอบ',
+  mobNotFound: 'ไม่พบหมายเลขคิว {q} ในระบบขณะนี้',
+  mobNotArrived: 'คิว {q} ยังไม่ได้ลงทะเบียนเข้ารับบริการ',
+  mobDone: 'คิว {q} รับบริการครบทุกขั้นตอนแล้ว ขอบคุณที่ใช้บริการ',
+  mobAhead: 'คิวก่อนหน้าท่าน',
+  mobEta: 'เวลารอโดยประมาณ',
+  mobCurrent: 'ขั้นตอนปัจจุบัน',
+  mobWaited: 'รอมาแล้ว',
+  mobInService: 'กำลังรับบริการ',
+  mobWalking: 'กำลังเดินไปยังจุดบริการ',
+  mobWaiting: 'กำลังรอ',
+  mobTry: 'ลองหมายเลขคิว:',
+  mobShow3d: 'แสดงภาพ 3 มิติ',
+  mobHide3d: 'ซ่อนภาพ 3 มิติ',
+  mobEtaNote: 'เวลาเป็นการประมาณจากข้อมูลจำลอง อาจคลาดเคลื่อนได้',
+  mobUpdated: 'อัปเดตล่าสุด {t}',
+  mobLocation: '{clinic} · {bld}',
+  dbgTitle: 'โหมดดีบัก',
+  dbgSeed: 'Seed',
+  dbgSurge: 'เพิ่มผู้ป่วยฉับพลัน (+{n} คน)',
+  dbgClear: 'ล้างการจำลองเพิ่ม',
+  dbgSelfTest: 'ผลทดสอบตัวเอง',
+  surgeToast: 'เพิ่มผู้ป่วย {n} คน ที่ {name}',
+  loading: 'กำลังจำลองข้อมูล…'
+};
+function t(key, params) {
+  let s = key.split('.').reduce((o, k) => (o == null ? o : o[k]), I18N);
+  if (s == null) return key;
+  if (params && typeof s === 'string') s = s.replace(/\{(\w+)\}/g, (_, k) => (params[k] ?? ''));
+  return s;
+}
+const fmtTime = (min) => { const m = Math.max(0, Math.floor(min)); return t('timeFmt', { hh: String(Math.floor(m / 60) % 24).padStart(2, '0'), mm: String(m % 60).padStart(2, '0') }); };
+const fmtDateTh = (iso) => {
+  const [y, m, d] = iso.split('-').map(Number);
+  const wd = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  return t('dateFmt', { wd: I18N.weekdays[wd], d, m: I18N.months[m - 1], y: y + 543 });
+};
+
+// ===== 4. SIM ENGINE =====
+// Seeded RNG (cyrb128 → sfc32): the same seed string always gives the same stream.
+function cyrb128(str) {
+  let h1 = 1779033703, h2 = 3144134277, h3 = 1013904242, h4 = 2773480762;
+  for (let i = 0, k; i < str.length; i++) {
+    k = str.charCodeAt(i);
+    h1 = h2 ^ Math.imul(h1 ^ k, 597399067); h2 = h3 ^ Math.imul(h2 ^ k, 2869860233);
+    h3 = h4 ^ Math.imul(h3 ^ k, 951274213); h4 = h1 ^ Math.imul(h4 ^ k, 2716044179);
+  }
+  h1 = Math.imul(h3 ^ (h1 >>> 18), 597399067); h2 = Math.imul(h4 ^ (h2 >>> 22), 2869860233);
+  h3 = Math.imul(h1 ^ (h3 >>> 17), 951274213); h4 = Math.imul(h2 ^ (h4 >>> 19), 2716044179);
+  h1 ^= (h2 ^ h3 ^ h4); h2 ^= h1; h3 ^= h1; h4 ^= h1;
+  return [h1 >>> 0, h2 >>> 0, h3 >>> 0, h4 >>> 0];
+}
+function makeRng(seed) {
+  let [a, b, c, d] = cyrb128(seed);
+  const next = () => {
+    a |= 0; b |= 0; c |= 0; d |= 0;
+    const t0 = (((a + b) | 0) + d) | 0; d = (d + 1) | 0;
+    a = b ^ (b >>> 9); b = (c + (c << 3)) | 0; c = (c << 21) | (c >>> 11); c = (c + t0) | 0;
+    return (t0 >>> 0) / 4294967296;
+  };
+  for (let i = 0; i < 15; i++) next();
+  return {
+    next,
+    normal() { let u = 0; while (u === 0) u = next(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * next()); },
+    weighted(weights, total) { let r = next() * total; for (let i = 0; i < weights.length; i++) { r -= weights[i]; if (r < 0) return i; } return weights.length - 1; }
+  };
+}
+const sampleService = (rng, s) => {
+  const v = s.mean + rng.normal() * s.sd;
+  return Math.min(s.mean * CONFIG.serviceClamp[1], Math.max(s.mean * CONFIG.serviceClamp[0], v));
+};
+const isWeekend = (iso) => { const [y, m, d] = iso.split('-').map(Number); const wd = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); return wd === 0 || wd === 6; };
+
+class MinHeap {
+  constructor() { this.a = []; }
+  get size() { return this.a.length; }
+  less(i, j) { const A = this.a[i], B = this.a[j]; return A.t < B.t || (A.t === B.t && A.s < B.s); }
+  push(e) { const a = this.a; a.push(e); let i = a.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (!this.less(i, p)) break; [a[i], a[p]] = [a[p], a[i]]; i = p; } }
+  pop() {
+    const a = this.a, top = a[0], last = a.pop();
+    if (a.length) { a[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i;
+      if (l < a.length && this.less(l, m)) m = l; if (r < a.length && this.less(r, m)) m = r; if (m === i) break; [a[i], a[m]] = [a[m], a[i]]; i = m; } }
+    return top;
+  }
+}
+
+/** Is server `k` of a station on duty at minute t? Returns next on-duty time if not. */
+function dutyNext(st, k, t) {
+  if (st.stage !== 'doctor') return t;
+  const S = CONFIG.shifts;
+  if (t < S.doctorStart) return S.doctorStart;
+  if (k % S.lunchOffEvery === 1 && t >= S.lunchStart && t < S.lunchEnd) return S.lunchEnd;
+  return t;
+}
+
+/** Create the day's patients (deterministic for a date). Service times are pre-sampled per patient. */
+function generatePatients(date, topo, surges) {
+  const rng = makeRng(date);
+  const C = CONFIG, slots = C.arrivalCurve, sTot = slots.reduce((a, b) => a + b, 0);
+  const shares = C.clinics.map(c => c.share), shTot = shares.reduce((a, b) => a + b, 0);
+  let n = C.volume.visitsPerDay * (1 + (rng.next() * 2 - 1) * C.volume.dailyJitter);
+  if (isWeekend(date)) n *= C.volume.weekendFactor;
+  n = Math.round(n);
+  const raw = [];
+  for (let i = 0; i < n; i++) {
+    const s = rng.weighted(slots, sTot);
+    raw.push({ arrival: C.day.arrivalsStart + s * 30 + rng.next() * 30, ci: rng.weighted(shares, shTot), u: [rng.next(), rng.next(), rng.next(), rng.next()] });
+  }
+  raw.sort((a, b) => a.arrival - b.arrival);
+  const seq = {};
+  const patients = [];
+  const mk = (r, clinic, rngS) => {
+    const route = [];
+    const bld = clinic.building;
+    for (const stage of C.clinicStages) route.push(topo.get(bld, clinic.id, stage));
+    if (r.u[0] < (clinic.pLab ?? C.flow.pLabDefault)) route.push(topo.get(bld, null, 'lab'));
+    route.push(topo.get(bld, null, 'cashier'));
+    let med = 'none';
+    if (r.u[1] >= C.flow.pNoMed) { med = r.u[2] < C.flow.pHomeDelivery ? 'home' : 'hosp'; route.push(topo.get(bld, null, med === 'home' ? 'pharmHome' : 'pharmHosp')); }
+    seq[clinic.id] = (seq[clinic.id] || 0) + 1;
+    return { id: patients.length, queueNo: `${clinic.prefix}-${String(seq[clinic.id]).padStart(3, '0')}`, clinicId: clinic.id, building: bld,
+             arrival: r.arrival, med, rank: r.u[3], route: route.filter(Boolean), svc: route.filter(Boolean).map(st => sampleService(rngS, st.service)), recs: [] };
+  };
+  const rngSvc = makeRng(date + '#svc');
+  for (const r of raw) patients.push(mk(r, C.clinics[r.ci], rngSvc));
+  // Debug surges: extra arrivals on top of the base day (base patients are untouched).
+  surges.forEach((sg, k) => {
+    const rs = makeRng(`${date}#surge#${k}`);
+    const clinic = C.clinics.find(c => c.id === sg.clinicId);
+    const extra = [];
+    for (let i = 0; i < sg.n; i++) extra.push({ arrival: sg.t + rs.next() * sg.spread, ci: 0, u: [rs.next(), rs.next(), rs.next(), rs.next()] });
+    extra.sort((a, b) => a.arrival - b.arrival);
+    for (const r of extra) patients.push(mk(r, clinic, rs));
+  });
+  // ER (separate block)
+  const er = topo.stations.find(s => s.stage === 'er');
+  if (er) {
+    const rE = makeRng(date + '#er'), cv = C.er.curve, cTot = cv.reduce((a, b) => a + b, 0);
+    const nE = Math.round(C.er.visitsPerDay * (1 + (rE.next() * 2 - 1) * 0.1));
+    const arr = [];
+    for (let i = 0; i < nE; i++) arr.push(C.day.open + rE.weighted(cv, cTot) * 30 + rE.next() * 30);
+    arr.sort((a, b) => a - b);
+    arr.forEach((a, i) => patients.push({ id: patients.length, queueNo: `${C.er.prefix}-${String(i + 1).padStart(3, '0')}`, clinicId: 'ER', building: er.building,
+      arrival: a, med: 'none', rank: rE.next(), route: [er], svc: [sampleService(rE, er.service)], recs: [], isER: true }));
+  }
+  return patients;
+}
+
+/** Discrete-event simulation of the whole day. Fills p.recs[] = {st, enq, start, end, server, seat, seat2, seatAt}. */
+function runDES(patients, topo) {
+  const heap = new MinHeap();
+  let seq = 0;
+  const S = topo.stations.map(st => ({ st, free: new Float64Array(st.servers), queue: [], qHead: 0, seatUsed: new Uint8Array(st.seats), wakeAt: Infinity }));
+  const ENQ = 0, DONE = 1, WAKE = 2;
+  for (const p of patients) heap.push({ t: p.arrival, s: seq++, type: ENQ, p, i: 0 });
+  const tryStart = (ss, t) => {
+    while (ss.qHead < ss.queue.length) {
+      let best = -1, nextDuty = Infinity;
+      for (let k = 0; k < ss.free.length; k++) {
+        if (ss.free[k] > t) continue;
+        const dn = dutyNext(ss.st, k, t);
+        if (dn <= t) { best = k; break; }
+        nextDuty = Math.min(nextDuty, dn);
+      }
+      if (best < 0) {
+        if (nextDuty < Infinity && nextDuty !== ss.wakeAt) { ss.wakeAt = nextDuty; heap.push({ t: nextDuty, s: seq++, type: WAKE, ss }); }
+        return;
+      }
+      const rec = ss.queue[ss.qHead++];
+      const p = rec.p;
+      rec.start = t; rec.server = best;
+      const seat = rec.seatAt != null ? rec.seat2 : rec.seat;
+      if (seat >= 0) {
+        // hand the freed seat to the earliest standing patient, if any
+        let handed = false;
+        for (let q = ss.qHead; q < ss.queue.length; q++) {
+          const o = ss.queue[q];
+          if (o.seat < 0 && o.seatAt == null) { o.seat2 = seat; o.seatAt = t; handed = true; break; }
+        }
+        if (!handed) ss.seatUsed[seat] = 0;
+      }
+      const dur = p.svc[rec.i];
+      rec.end = t + dur;
+      ss.free[best] = t + dur;
+      heap.push({ t: t + dur, s: seq++, type: DONE, ss, rec });
+    }
+  };
+  while (heap.size) {
+    const e = heap.pop();
+    if (e.type === ENQ) {
+      const p = e.p, st = p.route[e.i], ss = S[st.idx];
+      let seat = -1;
+      for (let k = 0; k < ss.seatUsed.length; k++) if (!ss.seatUsed[k]) { seat = k; ss.seatUsed[k] = 1; break; }
+      const rec = { p, i: e.i, st, enq: e.t, start: Infinity, end: Infinity, server: -1, seat, seat2: -1, seatAt: null };
+      p.recs.push(rec);
+      ss.queue.push(rec);
+      tryStart(ss, e.t);
+    } else if (e.type === DONE) {
+      const rec = e.rec, p = rec.p;
+      if (rec.i + 1 < p.route.length) heap.push({ t: e.t, s: seq++, type: ENQ, p, i: rec.i + 1 });
+      else p.exitT = e.t;
+      tryStart(e.ss, e.t);
+    } else { e.ss.wakeAt = Infinity; tryStart(e.ss, e.t); }
+  }
+  for (const p of patients) for (const r of p.recs) delete r.p; // drop back-reference
+}
+
+/** Minute-resolution density series per station → raw level → hysteresis level. */
+function buildSeries(patients, topo) {
+  const L = 1440;
+  const series = topo.stations.map(() => ({ cnt: new Float32Array(L), sum: new Float32Array(L) }));
+  for (const p of patients) for (const r of p.recs) {
+    const s = series[r.st.idx];
+    const m0 = Math.ceil(r.enq), m1 = Math.min(L, Math.ceil(r.start));
+    for (let m = m0; m < m1; m++) { s.cnt[m] += 1; s.sum[m] += m - r.enq; }
+  }
+  return topo.stations.map((st, i) => {
+    const raw = new Int8Array(L);
+    const { cnt, sum } = series[i];
+    for (let m = 0; m < L; m++) raw[m] = DENSITY.rawLevel(st.seats ? cnt[m] / st.seats : 0, cnt[m] ? sum[m] / cnt[m] : 0);
+    return { cnt, sum, raw, level: DENSITY.hysteresis(raw, CONFIG.density.hysteresisMin) };
+  });
+}
+
+/** Run a full day: patients + DES + series. Pure function of (date, surges). */
+function simulateDay(date, topo, surges = []) {
+  const t0 = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  const patients = generatePatients(date, topo, surges);
+  runDES(patients, topo);
+  const series = buildSeries(patients, topo);
+  const clinicLevel = {};
+  for (const c of CONFIG.clinics) {
+    const sts = CONFIG.clinicStages.map(s => topo.get(c.building, c.id, s)).filter(Boolean);
+    const lv = new Int8Array(1440);
+    for (let m = 0; m < 1440; m++) { let v = 0; for (const st of sts) v = Math.max(v, series[st.idx].level[m]); lv[m] = v; }
+    clinicLevel[c.id] = lv;
+  }
+  const ms = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
+  return { date, patients, series, clinicLevel, ms };
+}
+
+// ===== 5. DATA ADAPTER =====
+/*
+  Interface (the ONLY thing UI/renderer read):
+    getSnapshot(simTime) → { simTime, date, mode, agents[], stageCounts, clinicStats, stationStats, er, kpis, recentCalls }
+    subscribe(cb) → unsubscribe()          cb({type:'data'|'date'|'mode'}) when underlying data changes
+    setDate('YYYY-MM-DD'), setMode('live'|'replay')
+    lookupQueue(queueNo, simTime) → patient-facing status for mobile mode
+    getTopology() → static stations (from CONFIG + LAYOUT), getSeed()
+*/
+class SimulatedAdapter {
+  constructor(topo) { this.topo = topo; this.subs = new Set(); this.mode = 'live'; this.date = null; this.surges = []; this.day = null; }
+  getTopology() { return this.topo; }
+  getSeed() { return this.date; }
+  subscribe(cb) { this.subs.add(cb); return () => this.subs.delete(cb); }
+  emit(type) { for (const cb of this.subs) cb({ type }); }
+  setMode(mode) { if (mode !== this.mode) { this.mode = mode; this.emit('mode'); } }
+  setDate(date) {
+    if (date === this.date && this.day) return;
+    this.date = date; this.surges = [];
+    this.day = simulateDay(date, this.topo, this.surges);
+    this.byQueue = new Map(this.day.patients.map(p => [p.queueNo, p]));
+    this.emit('date');
+  }
+  /** Debug only: inject extra arrivals into a clinic and re-run the (deterministic) day. */
+  forceSurge(clinicId, simTime) {
+    this.surges.push({ clinicId, t: simTime, n: CONFIG.debug.surgePatients, spread: CONFIG.debug.surgeSpreadMin });
+    this.day = simulateDay(this.date, this.topo, this.surges);
+    this.byQueue = new Map(this.day.patients.map(p => [p.queueNo, p]));
+    this.emit('data');
+  }
+  clearSurges() { this.surges = []; this.day = simulateDay(this.date, this.topo, []); this.byQueue = new Map(this.day.patients.map(p => [p.queueNo, p])); this.emit('data'); }
+
+  /** Locate patient p at time t. Returns null if not in the building. */
+  static locate(p, t) {
+    if (t < p.arrival) return null;
+    if (p.exitT != null && t >= p.exitT) {
+      if (t >= p.exitT + CONFIG.flow.exitWalkMin) return null;
+      const last = p.recs[p.recs.length - 1];
+      return { state: 'exit', rec: last, prev: last, walkT: (t - p.exitT) / CONFIG.flow.exitWalkMin };
+    }
+    for (let i = p.recs.length - 1; i >= 0; i--) {
+      const r = p.recs[i];
+      if (r.enq <= t) {
+        if (t >= r.start) return { state: 'service', rec: r, prev: p.recs[i - 1] || null, walkT: 1 };
+        const since = t - r.enq;
+        return { state: since < CONFIG.flow.walkMin ? 'walk' : 'wait', rec: r, prev: p.recs[i - 1] || null, walkT: Math.min(1, since / CONFIG.flow.walkMin) };
+      }
+    }
+    return null;
+  }
+
+  getSnapshot(simTime) {
+    const t = simTime, day = this.day, topo = this.topo, C = CONFIG;
+    const m = Math.max(0, Math.min(1439, Math.floor(t)));
+    const scopes = ['ALL', ...C.buildings.map(b => b.id)];
+    const stAcc = topo.stations.map(() => ({ waiting: 0, service: 0, waitSum: 0, over: 0, standing: [] }));
+    const kp = {};
+    for (const s of scopes) kp[s] = { exitsHr: 0, arrived: 0, pharmHospServed: 0, pharmHomeServed: 0 };
+    const clinicTp = {};
+    const agents = [];
+    const calls = [];
+    let erExitsHr = 0;
+    for (const p of day.patients) {
+      if (p.isER) {
+        if (p.exitT != null && p.exitT <= t && p.exitT > t - 60) erExitsHr++;
+      } else {
+        if (p.arrival <= t) { kp.ALL.arrived++; kp[p.building].arrived++; }
+        if (p.exitT != null && p.exitT <= t && p.exitT > t - 60) { kp.ALL.exitsHr++; kp[p.building].exitsHr++; }
+        for (const r of p.recs) {
+          if (r.st.stage === 'doctor' && r.end <= t && r.end > t - 60) clinicTp[p.clinicId] = (clinicTp[p.clinicId] || 0) + 1;
+          if ((r.st.stage === 'pharmHosp' || r.st.stage === 'pharmHome') && r.end <= t) {
+            const k = r.st.stage === 'pharmHosp' ? 'pharmHospServed' : 'pharmHomeServed'; kp.ALL[k]++; kp[p.building][k]++;
+          }
+          if (r.start <= t && r.start > t - 6 && (r.st.stage === 'doctor' || r.st.stage === 'pharmHosp' || r.st.stage === 'lab'))
+            calls.push({ t: r.start, queueNo: p.queueNo, kind: r.st.stage, room: r.server + 1, clinicId: p.clinicId, building: p.building });
+        }
+      }
+      const loc = SimulatedAdapter.locate(p, t);
+      if (!loc) continue;
+      const r = loc.rec, st = r.st, acc = stAcc[st.idx];
+      const a = { id: p.id, queueNo: p.queueNo, clinicId: p.clinicId, building: p.building, stage: st.stage, stationId: st.id, stationIdx: st.idx,
+                  state: loc.state, seat: -1, line: -1, server: r.server, fromStationIdx: loc.prev ? loc.prev.st.idx : -1,
+                  fromServer: loc.prev ? loc.prev.server : -1, walkT: loc.walkT, waitMin: 0, rank: p.rank, isER: !!p.isER, enq: r.enq };
+      if (loc.state === 'exit') { a.fromStationIdx = st.idx; a.fromServer = r.server; a.stage = 'exit'; }
+      else if (loc.state === 'service') { acc.service++; }
+      else {
+        const w = t - r.enq;
+        a.waitMin = w; acc.waiting++; acc.waitSum += w;
+        if (w > C.density.waitRed) acc.over++;
+        a.seat = (r.seatAt != null && t >= r.seatAt) ? r.seat2 : r.seat;
+        if (a.seat < 0) acc.standing.push(a);
+      }
+      agents.push(a);
+    }
+    for (const acc of stAcc) { acc.standing.sort((x, y) => x.enq - y.enq); acc.standing.forEach((a, i) => { a.line = i; }); acc.standing = null; }
+
+    // per-station stats
+    const stationStats = {};
+    const statOf = (st) => {
+      const acc = stAcc[st.idx], ser = day.series[st.idx];
+      let redFor = 0;
+      if (ser.level[m] === 2) { for (let k = m; k >= 0 && ser.level[k] === 2; k--) redFor++; }
+      return { id: st.id, stage: st.stage, building: st.building, clinicId: st.clinicId, waiting: acc.waiting, service: acc.service,
+               seats: st.seats, servers: st.servers, occ: st.seats ? acc.waiting / st.seats : 0,
+               avgWait: acc.waiting ? acc.waitSum / acc.waiting : 0, over: acc.over, level: ser.level[m], rawLevel: ser.raw[m], redForMin: redFor };
+    };
+    for (const st of topo.stations) stationStats[st.id] = statOf(st);
+
+    // stage counts (OPD only; ER excluded)
+    const stageCounts = {};
+    for (const s of scopes) { stageCounts[s] = {}; for (const stg of C.stageOrder) stageCounts[s][stg] = { waiting: 0, service: 0 }; }
+    for (const st of topo.stations) {
+      if (st.stage === 'er') continue;
+      const ss = stationStats[st.id];
+      for (const s of ['ALL', st.building]) { stageCounts[s][st.stage].waiting += ss.waiting; stageCounts[s][st.stage].service += ss.service; }
+    }
+
+    // clinic stats
+    const clinicStats = {};
+    for (const c of C.clinics) {
+      const stages = {};
+      let total = 0, waiting = 0, wsum = 0;
+      for (const stg of C.clinicStages) {
+        const st = topo.get(c.building, c.id, stg); if (!st) continue;
+        const ss = stationStats[st.id]; stages[stg] = ss;
+        total += ss.waiting + ss.service; waiting += ss.waiting; wsum += ss.avgWait * ss.waiting;
+      }
+      const lv = day.clinicLevel[c.id];
+      let redFor = 0; if (lv[m] === 2) for (let k = m; k >= 0 && lv[k] === 2; k--) redFor++;
+      clinicStats[c.id] = { id: c.id, nameTh: c.nameTh, building: c.building, stages, total, waiting,
+                            avgWait: waiting ? wsum / waiting : 0, throughputHr: clinicTp[c.id] || 0, level: lv[m], redForMin: redFor };
+    }
+
+    // KPIs per scope
+    const kpis = {};
+    for (const s of scopes) {
+      const sc = stageCounts[s];
+      let total = 0, waiting = 0, wsum = 0, over = 0;
+      const waitingByStage = {}, serviceByStage = {};
+      for (const stg of C.stageOrder) { total += sc[stg].waiting + sc[stg].service; waiting += sc[stg].waiting; waitingByStage[stg] = sc[stg].waiting; serviceByStage[stg] = sc[stg].service; }
+      for (const st of topo.stations) if (st.stage !== 'er' && (s === 'ALL' || st.building === s)) { const ss = stationStats[st.id]; wsum += ss.avgWait * ss.waiting; over += ss.over; }
+      const cl = C.clinics.filter(c => s === 'ALL' || c.building === s);
+      const red = cl.filter(c => clinicStats[c.id].level === 2).length;
+      kpis[s] = { total, waiting, inService: total - waiting, waitingByStage, serviceByStage, avgWait: waiting ? wsum / waiting : 0, overThreshold: over,
+                  throughputHr: kp[s].exitsHr, pharmHospNow: sc.pharmHosp.waiting + sc.pharmHosp.service, pharmHomeNow: sc.pharmHome.waiting + sc.pharmHome.service,
+                  pharmHospServed: kp[s].pharmHospServed, pharmHomeServed: kp[s].pharmHomeServed, clinicsRed: red, clinicsTotal: cl.length,
+                  pctClinicsRed: cl.length ? (100 * red) / cl.length : 0, arrivedToday: kp[s].arrived };
+    }
+    const erSt = topo.stations.find(s => s.stage === 'er');
+    const er = erSt ? { ...stationStats[erSt.id], present: stationStats[erSt.id].waiting + stationStats[erSt.id].service, exitsHr: erExitsHr } : null;
+    calls.sort((x, y) => y.t - x.t);
+    return { simTime: t, date: this.date, mode: this.mode, agents, stageCounts, clinicStats, stationStats, er, kpis, recentCalls: calls.slice(0, 14) };
+  }
+
+  lookupQueue(queueNo, t) {
+    const p = this.byQueue.get(String(queueNo || '').trim().toUpperCase());
+    if (!p) return { found: false };
+    const route = p.route.map(st => st.stage);
+    if (t < p.arrival) return { found: true, status: 'notArrived', queueNo: p.queueNo, route };
+    const loc = SimulatedAdapter.locate(p, t);
+    if (!loc || loc.state === 'exit') return { found: true, status: 'done', queueNo: p.queueNo, route };
+    const r = loc.rec, st = r.st;
+    let ahead = 0;
+    if (loc.state !== 'service') {
+      for (const q of this.day.patients) {
+        if (q === p) continue;
+        for (const o of q.recs) if (o.st === st && o.enq < r.enq && o.enq <= t && o.start > t) ahead++;
+      }
+    }
+    const eta = loc.state === 'service' ? 0 : Math.max(1, Math.round(((ahead + 0.5) * st.service.mean) / st.servers));
+    return { found: true, status: loc.state, queueNo: p.queueNo, clinicId: p.clinicId, building: p.building, stage: st.stage,
+             stageIndex: r.i, route, ahead, etaMin: eta, waitedMin: loc.state === 'service' ? 0 : t - r.enq };
+  }
+  /** A few queue numbers currently waiting (for the mobile demo chips). */
+  sampleQueues(t, n = 4) {
+    const out = [];
+    for (const p of this.day.patients) { if (p.isER) continue; const l = SimulatedAdapter.locate(p, t); if (l && l.state === 'wait' && p.rank < 0.02) out.push(p.queueNo); if (out.length >= n) break; }
+    return out;
+  }
+}
+
+/**
+ * ApiAdapter — STUB for the real HIS/queue system. Same interface as SimulatedAdapter.
+ * TODO: poll or subscribe (WebSocket/SSE) to the HIS queue API and map records to Agent objects.
+ * Expected HIS fields per active visit (NO names, NO HN – only a visit token + queue number):
+ *   visitToken (opaque id), queueNo ("MED-023"), clinicCode (→ CONFIG.clinics[].id), buildingCode,
+ *   currentStage (screen|vitals|doctor|lab|cashier|pharmHosp|pharmHome), stageStatus (waiting|in_service|done),
+ *   enqueuedAt (ISO time the patient joined the current stage queue), serviceStartedAt, servicePointNo (room/window),
+ *   medicationChannel (none|hospital|home_delivery), visitStartedAt, visitEndedAt.
+ * TODO: per-stage counts may also come pre-aggregated from HIS; recompute KPIs here so the UI contract is unchanged.
+ * TODO: density levels must use DENSITY.LiveHysteresis (online) instead of precomputed series.
+ * TODO: replay = fetch historical event log for the date and reconstruct state with the same locate() logic.
+ * TODO: seat/line positions are visual only – assign seats client-side (lowest free seat) on first sight.
+ */
+class ApiAdapter {
+  constructor(topo, baseUrl) { this.topo = topo; this.baseUrl = baseUrl; this.subs = new Set(); this.mode = 'live'; this.date = null; }
+  getTopology() { return this.topo; }
+  getSeed() { return null; }
+  subscribe(cb) { this.subs.add(cb); return () => this.subs.delete(cb); }
+  setMode(mode) { this.mode = mode; /* TODO: switch between live stream and historical fetch */ }
+  setDate(date) { this.date = date; /* TODO: GET {baseUrl}/opd/visits?date=YYYY-MM-DD */ }
+  getSnapshot(simTime) { /* TODO */ return null; }
+  lookupQueue(queueNo, simTime) { /* TODO: GET {baseUrl}/opd/queue/{queueNo} */ return { found: false }; }
+  sampleQueues() { return []; }
+}
+
+// ===== 6. DENSITY & ALERTS =====
+const DENSITY = {
+  /** 0 green, 1 yellow, 2 red. Level = the worse of occupancy level and wait level. */
+  rawLevel(occ, wait) {
+    const D = CONFIG.density;
+    const lo = occ > D.occRed ? 2 : occ >= D.occYellow ? 1 : 0;
+    const lw = wait > D.waitRed ? 2 : wait >= D.waitYellow ? 1 : 0;
+    return Math.max(lo, lw);
+  },
+  /** Hysteresis over a per-minute series: a new level must persist ≥ minMin minutes before it shows. */
+  hysteresis(raw, minMin) {
+    const out = new Int8Array(raw.length);
+    let disp = raw[0], cand = -1, run = 0;
+    for (let i = 0; i < raw.length; i++) {
+      const r = raw[i];
+      if (r === disp) { cand = -1; run = 0; }
+      else if (r === cand) { if (++run >= minMin) { disp = r; cand = -1; run = 0; } }
+      else { cand = r; run = 1; if (run >= minMin) { disp = r; cand = -1; run = 0; } }
+      out[i] = disp;
+    }
+    return out;
+  },
+  /** Online variant for real data (ApiAdapter): update(key, raw, simMinute) → displayed level. */
+  LiveHysteresis: class {
+    constructor(minMin) { this.minMin = minMin; this.s = new Map(); }
+    update(key, raw, tMin) {
+      let s = this.s.get(key);
+      if (!s) { s = { disp: raw, cand: raw, since: tMin }; this.s.set(key, s); return raw; }
+      if (raw === s.disp) { s.cand = raw; s.since = tMin; return s.disp; }
+      if (raw !== s.cand) { s.cand = raw; s.since = tMin; }
+      if (tMin - s.since >= this.minMin) s.disp = raw;
+      return s.disp;
+    }
+  }
+};
+
+const ALERTS = {
+  /** Alerts (all modes) + rule-based suggestions (command mode). scope: 'ALL' or building id. */
+  evaluate(snap, scope, topo) {
+    const alerts = [], suggestions = [];
+    const inScope = (b) => scope === 'ALL' || b === scope;
+    const bName = (id) => (CONFIG.buildings.find(b => b.id === id) || { nameTh: id }).nameTh;
+    for (const c of CONFIG.clinics) {
+      const cs = snap.clinicStats[c.id];
+      if (!inScope(c.building) || cs.level < 2) continue;
+      let worst = null;
+      for (const stg of CONFIG.clinicStages) { const s = cs.stages[stg]; if (s && (!worst || s.level > worst.level || (s.level === worst.level && s.avgWait > worst.avgWait))) worst = s; }
+      alerts.push({ key: c.id, kind: 'clinic', clinicId: c.id, title: c.nameTh, redForMin: cs.redForMin,
+                    body: t('alertClinic', { stage: t('stageWait.' + worst.stage), n: worst.waiting, w: Math.round(worst.avgWait) }) });
+    }
+    for (const st of topo.stations) {
+      if (st.clinicId || !inScope(st.building)) continue;
+      const ss = snap.stationStats[st.id];
+      if (ss.level < 2) continue;
+      alerts.push({ key: st.id, kind: 'station', stationId: st.id, title: t('stage.' + st.stage), redForMin: ss.redForMin,
+                    body: t('alertStage', { bld: bName(st.building), n: ss.waiting, w: Math.round(ss.avgWait) }) });
+    }
+    if (snap.er && scope === 'ALL' && snap.er.level === 2)
+      alerts.push({ key: 'ER', kind: 'er', title: t('erName'), redForMin: snap.er.redForMin, body: t('alertStage', { bld: t('erName'), n: snap.er.waiting, w: Math.round(snap.er.avgWait) }) });
+
+    const match = (rule, level, redFor, avgWait) =>
+      (rule.level != null ? (level >= rule.level && redFor >= (rule.minDurationMin || 0)) : true) &&
+      (rule.avgWaitGt != null ? avgWait > rule.avgWaitGt : true);
+    for (const rule of CONFIG.rules) {
+      if (rule.target === 'clinic') {
+        for (const c of CONFIG.clinics) { const cs = snap.clinicStats[c.id]; if (inScope(c.building) && match(rule, cs.level, cs.redForMin, cs.avgWait))
+          suggestions.push({ key: rule.id + c.id, text: t(rule.textKey, { name: c.nameTh, n: rule.minDurationMin }) }); }
+      } else if (rule.target === 'stage') {
+        for (const st of topo.stations) { if (st.stage !== rule.stage || !inScope(st.building)) continue; const ss = snap.stationStats[st.id];
+          if (match(rule, ss.level, ss.redForMin, ss.avgWait)) {
+            const name = st.clinicId ? (CONFIG.clinics.find(c => c.id === st.clinicId) || {}).nameTh : bName(st.building);
+            suggestions.push({ key: rule.id + st.id, text: t(rule.textKey, { name, bld: bName(st.building), w: Math.round(ss.avgWait) }) });
+          } }
+      } else if (rule.target === 'er' && snap.er && scope === 'ALL') {
+        if (match(rule, snap.er.level, snap.er.redForMin, snap.er.avgWait)) suggestions.push({ key: rule.id, text: t(rule.textKey) });
+      }
+    }
+    return { alerts, suggestions };
+  }
+};
+
+// ===== 7. SCENE / RENDERER =====
+class OpdScene {
+  constructor(container, topo, opts) {
+    this.container = container; this.topo = topo; this.opts = opts;
+    this.reduced = opts.reducedMotion;
+    const W = container.clientWidth || 1, H = container.clientHeight || 1;
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, CONFIG.render.maxPixelRatio));
+    renderer.setSize(W, H);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.setClearColor(new THREE.Color(CONFIG.sceneColors.ground));
+    container.appendChild(renderer.domElement);
+    this.renderer = renderer;
+    const labels = new CSS2DRenderer();
+    labels.setSize(W, H);
+    Object.assign(labels.domElement.style, { position: 'absolute', top: '0', left: '0', pointerEvents: 'none' });
+    container.appendChild(labels.domElement);
+    this.labelRenderer = labels;
+
+    this.scene = new THREE.Scene();
+    const fh = CONFIG.render.frustumH, aspect = W / H;
+    this.camera = new THREE.OrthographicCamera(-fh * aspect / 2, fh * aspect / 2, fh / 2, -fh / 2, -500, 1500);
+    this.camDir = new THREE.Vector3(1, 1.05, 1).normalize();
+    this.camDist = 400;
+
+    // bounds of the whole site
+    const bs = Object.values(topo.buildings);
+    this.bounds = { x0: Math.min(...bs.map(b => b.x - b.w / 2)), x1: Math.max(...bs.map(b => b.x + b.w / 2)),
+                    z0: Math.min(...bs.map(b => b.z - b.d / 2)), z1: Math.max(...bs.map(b => b.z + b.d / 2)) };
+    const cx = (this.bounds.x0 + this.bounds.x1) / 2, cz = (this.bounds.z0 + this.bounds.z1) / 2;
+
+    this.scene.add(new THREE.HemisphereLight(0xffffff, 0xcfd8d4, 1.6));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.7);
+    sun.position.set(cx - 90, 220, cz + 130); sun.target.position.set(cx, 0, cz);
+    sun.castShadow = true;
+    sun.shadow.mapSize.set(CONFIG.render.shadowMapSize, CONFIG.render.shadowMapSize);
+    const half = Math.hypot(this.bounds.x1 - this.bounds.x0, this.bounds.z1 - this.bounds.z0) / 2 + 10;
+    Object.assign(sun.shadow.camera, { left: -half, right: half, top: half, bottom: -half, near: 1, far: 600 });
+    sun.shadow.bias = -0.0008; sun.shadow.normalBias = 0.03; sun.shadow.radius = 3;
+    this.scene.add(sun, sun.target);
+
+    this.controls = new OrbitControls(this.camera, renderer.domElement);
+    Object.assign(this.controls, { enableDamping: true, dampingFactor: 0.12, screenSpacePanning: false,
+      minPolarAngle: 0.72, maxPolarAngle: 1.02, minAzimuthAngle: Math.PI / 4 - 0.45, maxAzimuthAngle: Math.PI / 4 + 0.45,
+      minZoom: 0.3, maxZoom: 7 });
+    this.controls.enabled = !!opts.interactive;
+    this.insets = opts.insets;
+    this.setView({ x: cx, z: cz }, 1, true);
+    this.focusBuilding('ALL', true);
+
+    this.geoms = {};
+    for (const st of topo.stations) this.geoms[st.idx] = roomGeometry(st.room, topo.buildings[st.building], st.servers);
+    this.buildStatic();
+    this.buildAgents();
+    this.buildOverlays();
+    this.buildLabels();
+    this.smooth = new Map();
+    this.colorMode = 'stage';
+    this.visibleBuilding = 'ALL';
+    this.fly = null;
+    this.raycaster = new THREE.Raycaster();
+    this.pointer = new THREE.Vector2();
+    window.addEventListener('resize', () => this.resize());
+  }
+
+  /** Zoom that fits an axis-aligned world rect on screen (projected with the isometric camera basis). */
+  /** Projected screen-space extent (world units) of a list of rects [x0,x1,z0,z1]. */
+  projExtent(rects) {
+    const f = this.camDir.clone().negate(), r = new THREE.Vector3().crossVectors(f, new THREE.Vector3(0, 1, 0)).normalize();
+    const u = new THREE.Vector3().crossVectors(r, f);
+    let ax = Infinity, bx = -Infinity, ay = Infinity, by = -Infinity;
+    for (const [x0, x1, z0, z1] of rects) for (const x of [x0, x1]) for (const z of [z0, z1]) for (const y of [0, 3]) {
+      const c = new THREE.Vector3(x, y, z); const px = c.dot(r), py = c.dot(u);
+      ax = Math.min(ax, px); bx = Math.max(bx, px); ay = Math.min(ay, py); by = Math.max(by, py);
+    }
+    return { ax, bx, ay, by, r, u };
+  }
+  fitRectZoom(x0, x1, z0, z1, pad = 1.1) { return this.fitRectsZoom([[x0, x1, z0, z1]], pad); }
+  fitRectsZoom(rects, pad = 1.1) {
+    const W = this.container.clientWidth || 1, H = this.container.clientHeight || 1, fh = CONFIG.render.frustumH;
+    const ins = this.effInsets(), Wf = W - ins.left - ins.right, Hf = H - ins.top - ins.bottom;
+    const { ax, bx, ay, by } = this.projExtent(rects);
+    return Math.min((fh * Wf / H) / ((bx - ax) * pad), (fh * Hf / H) / ((by - ay) * pad));
+  }
+  /** Screen insets (px) covered by UI panels; content is framed in the remaining area. */
+  effInsets() {
+    const W = this.container.clientWidth || 1, H = this.container.clientHeight || 1, i = this.insets || { left: 0, right: 0, top: 0, bottom: 0 };
+    const sx = Math.min(1, (W * 0.6) / Math.max(1, i.left + i.right)), sy = Math.min(1, (H * 0.5) / Math.max(1, i.top + i.bottom));
+    return { left: i.left * sx, right: i.right * sx, top: i.top * sy, bottom: i.bottom * sy };
+  }
+  /** Fly so that rect is centred in the free (non-covered) area. */
+  frameRect(x0, x1, z0, z1, pad, maxZoom = 6) { this.frameRects([[x0, x1, z0, z1]], pad, maxZoom); }
+  frameRects(rects, pad, maxZoom = 6) {
+    const zoom = Math.max(this.controls.minZoom, Math.min(this.fitRectsZoom(rects, pad), maxZoom));
+    const H = this.container.clientHeight || 1, upp = CONFIG.render.frustumH / (H * zoom), ins = this.effInsets();
+    const { ax, bx, ay, by, r, u } = this.projExtent(rects);
+    // centre of the projected extent, expressed as a ground point
+    const p = new THREE.Vector3().addScaledVector(r, (ax + bx) / 2).addScaledVector(u, (ay + by) / 2)
+      .addScaledVector(r, -((ins.left - ins.right) / 2) * upp).addScaledVector(u, ((ins.top - ins.bottom) / 2) * upp);
+    p.addScaledVector(this.camDir, -p.y / this.camDir.y);
+    this.setView({ x: p.x, z: p.z }, zoom);
+  }
+  setView(target, zoom, instant) {
+    const to = { x: target.x, z: target.z, zoom };
+    if (instant || this.reduced) {
+      this.controls.target.set(to.x, 0, to.z);
+      this.camera.position.copy(this.controls.target).addScaledVector(this.camDir, this.camDist);
+      this.camera.zoom = zoom; this.camera.updateProjectionMatrix(); this.controls.update(); this.fly = null; return;
+    }
+    const tg = this.controls.target;
+    this.fly = { from: { x: tg.x, z: tg.z, zoom: this.camera.zoom }, to, t0: performance.now(), dur: CONFIG.render.flyMs,
+                 off: this.camera.position.clone().sub(tg) };
+  }
+  focusBuilding(id, instant) {
+    const rect = ({ x, z, w, d }) => [x - w / 2, x + w / 2, z - d / 2, z + d / 2];
+    const rects = id === 'ALL' ? Object.values(this.topo.buildings).map(rect) : [rect(this.topo.buildings[id])];
+    this.frameRects(rects, id === 'ALL' ? 1.04 : 1.12);
+    if (instant && this.fly) { this.fly.dur = 0; this.render(performance.now() + 1); }
+  }
+  focusRect(x0, x1, z0, z1, pad = 1.5) { this.frameRect(x0, x1, z0, z1, pad); }
+  clinicRect(clinicId) {
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (const st of this.topo.stations) if (st.clinicId === clinicId) { const g = this.geoms[st.idx]; x0 = Math.min(x0, g.x0); x1 = Math.max(x1, g.x1); z0 = Math.min(z0, g.z0); z1 = Math.max(z1, g.z1); }
+    return { x0, x1, z0, z1 };
+  }
+  focusClinic(clinicId) { const r = this.clinicRect(clinicId); if (isFinite(r.x0)) this.focusRect(r.x0, r.x1, r.z0, r.z1); }
+  focusStation(idx) { const g = this.geoms[idx]; this.focusRect(g.x0, g.x1, g.z0, g.z1, 2.2); }
+
+  // ---- static scene: everything merged into one vertex-coloured mesh (+ instanced chairs/trees) ----
+  buildStatic() {
+    const SC = CONFIG.sceneColors, parts = [];
+    const col = new THREE.Color();
+    const box = (w, h, d, x, y, z, color) => {
+      const g = new THREE.BoxGeometry(w, h, d); g.translate(x, y, z);
+      col.set(color); const n = g.attributes.position.count, c = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { c[i * 3] = col.r; c[i * 3 + 1] = col.g; c[i * 3 + 2] = col.b; }
+      g.setAttribute('color', new THREE.BufferAttribute(c, 3)); parts.push(g);
+    };
+    const ground = new THREE.Mesh(new THREE.PlaneGeometry(2000, 2000), new THREE.MeshStandardMaterial({ color: SC.ground, roughness: 1 }));
+    ground.rotation.x = -Math.PI / 2; ground.position.y = -0.42; ground.receiveShadow = true; this.scene.add(ground);
+
+    for (const b of Object.values(this.topo.buildings)) {
+      box(b.w + 1.2, 0.4, b.d + 1.2, b.x, -0.2, b.z, SC.slab);
+      const wt = 0.35, hi = 2.6, lo = 0.55;
+      box(b.w, hi, wt, b.x, hi / 2, b.z - b.d / 2, SC.wall);           // back wall (full)
+      box(wt, hi, b.d, b.x - b.w / 2, hi / 2, b.z, SC.wall);           // left wall (full)
+      box(wt, lo, b.d, b.x + b.w / 2, lo / 2, b.z, SC.wallLow);        // right wall (cut-away)
+      // front wall with door gaps
+      const doors = [b.entrance.x, b.exit.x].sort((a, c) => a - c), gap = 5;
+      let xs = -b.w / 2;
+      for (const dx of doors) { const xe = dx - gap / 2; if (xe > xs) box(xe - xs, lo, wt, b.x + (xs + xe) / 2, lo / 2, b.z + b.d / 2, SC.wallLow); xs = dx + gap / 2; }
+      if (xs < b.w / 2) box(b.w / 2 - xs, lo, wt, b.x + (xs + b.w / 2) / 2, lo / 2, b.z + b.d / 2, SC.wallLow);
+      for (const dpt of [b.entrance, b.exit]) box(gap, 0.06, 3, b.x + dpt.x, 0.03, b.z + dpt.z + 1.4, '#d6e4ea');
+    }
+    for (const st of this.topo.stations) {
+      const g = this.geoms[st.idx], room = st.room;
+      const floor = st.stage === 'er' ? SC.erFloor : st.clinicId ? (st.stage === 'doctor' ? SC.clinicFloor : SC.clinicFloorAlt)
+        : (st.stage.startsWith('pharm') ? SC.pharmFloor : SC.sharedFloor);
+      box(room.w, 0.06, room.d, g.cx, 0.03, g.cz, floor);
+      for (const bt of g.booths) {
+        const h = st.stage === 'er' ? 0.9 : 2.0, wt = 0.12;
+        box(bt.w, h, wt, bt.x, h / 2, bt.z - bt.d / 2, SC.booth);
+        box(wt, h, bt.d, bt.x - bt.w / 2, h / 2, bt.z, SC.booth);
+        box(wt, h, bt.d, bt.x + bt.w / 2, h / 2, bt.z, SC.booth);
+        if (st.stage === 'er') box(bt.w * 0.55, 0.55, bt.d * 0.62, bt.x, 0.28, bt.z - 0.25, SC.bed);
+        else { box(0.9, 0.75, 0.6, bt.x, 0.38, bt.z - bt.d / 2 + 0.6, SC.counter); box(bt.w * 0.32, 0.08, wt, bt.x - bt.w * 0.33, 0.04, bt.z + bt.d / 2, '#9fc9da'); }
+      }
+      for (const c of g.counters) {
+        box(c.w, 1.0, 0.6, c.x, 0.5, c.z, SC.counter);
+        box(c.w, 0.06, 0.7, c.x, 1.03, c.z, st.stage.startsWith('pharm') ? '#7cc4a4' : '#8ab8cf');
+      }
+    }
+    const merged = mergeGeometries(parts, false);
+    parts.forEach(p => p.dispose());
+    const mesh = new THREE.Mesh(merged, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, metalness: 0 }));
+    mesh.castShadow = true; mesh.receiveShadow = true; this.scene.add(mesh);
+
+    // chairs (instanced)
+    const chairParts = [new THREE.BoxGeometry(0.56, 0.08, 0.5).translate(0, 0.44, 0), new THREE.BoxGeometry(0.56, 0.48, 0.07).translate(0, 0.7, 0.24),
+                        new THREE.BoxGeometry(0.08, 0.42, 0.42).translate(-0.22, 0.2, 0), new THREE.BoxGeometry(0.08, 0.42, 0.42).translate(0.22, 0.2, 0)];
+    const chairGeo = mergeGeometries(chairParts, false);
+    const seatsAll = [];
+    for (const st of this.topo.stations) for (const s of this.geoms[st.idx].seats) seatsAll.push(s);
+    const chairs = new THREE.InstancedMesh(chairGeo, new THREE.MeshStandardMaterial({ color: SC.chair, roughness: 0.6 }), seatsAll.length);
+    const mtx = new THREE.Matrix4();
+    seatsAll.forEach((s, i) => { mtx.makeTranslation(s.x, 0.03, s.z); chairs.setMatrixAt(i, mtx); });
+    chairs.castShadow = true; chairs.receiveShadow = true; this.scene.add(chairs);
+
+    // trees (instanced canopy + trunk)
+    const trees = LAYOUT.decor.filter(d => d.type === 'tree');
+    const canopy = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1.9, 1), new THREE.MeshStandardMaterial({ color: SC.leaf, flatShading: true, roughness: 0.8 }), trees.length);
+    const trunk = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.22, 0.3, 1.6, 6), new THREE.MeshStandardMaterial({ color: SC.trunk }), trees.length);
+    const q = new THREE.Quaternion(), sc = new THREE.Vector3(), p = new THREE.Vector3();
+    trees.forEach((tr, i) => {
+      const b = this.topo.buildings[tr.building] || { x: 0, z: 0 };
+      const s = 0.8 + ((i * 37) % 10) / 20;
+      p.set(b.x + tr.x, 2.2 * s + 0.6, b.z + tr.z); sc.set(s, s, s); mtx.compose(p, q, sc); canopy.setMatrixAt(i, mtx);
+      canopy.setColorAt(i, new THREE.Color(i % 3 === 0 ? SC.leaf2 : '#ffffff'));
+      p.set(b.x + tr.x, 0.4, b.z + tr.z); sc.set(1, 1, 1); mtx.compose(p, q, sc); trunk.setMatrixAt(i, mtx);
+    });
+    canopy.castShadow = trunk.castShadow = true; this.scene.add(canopy, trunk);
+  }
+
+  // ---- agents: one instanced figure mesh + one instanced ring mesh ----
+  buildAgents() {
+    const N = CONFIG.render.maxAgents;
+    const body = new THREE.CylinderGeometry(0.2, 0.27, 0.95, 8).translate(0, 0.48, 0);
+    const head = new THREE.SphereGeometry(0.19, 10, 8).translate(0, 1.18, 0);
+    const geo = mergeGeometries([body.toNonIndexed(), head.toNonIndexed()], false);
+    this.agentMesh = new THREE.InstancedMesh(geo, new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7 }), N);
+    this.agentMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.agentMesh.setColorAt(0, new THREE.Color());
+    this.agentMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
+    this.agentMesh.castShadow = true; this.agentMesh.frustumCulled = false; this.agentMesh.count = 0;
+    const ring = new THREE.RingGeometry(0.34, 0.52, 20).rotateX(-Math.PI / 2).translate(0, 0.08, 0);
+    this.ringMesh = new THREE.InstancedMesh(ring, new THREE.MeshBasicMaterial({ color: CONFIG.levelColors[2] }), N);
+    this.ringMesh.frustumCulled = false; this.ringMesh.count = 0;
+    this.scene.add(this.agentMesh, this.ringMesh);
+    this.stageCol = Object.fromEntries(Object.entries(CONFIG.stageColors).map(([k, v]) => [k, new THREE.Color(v)]));
+    this.levelCol = CONFIG.levelColors.map(c => new THREE.Color(c));
+  }
+
+  // ---- level overlays per station (border + pulsing fill) ----
+  buildOverlays() {
+    this.overlays = [];
+    this.pickables = [];
+    for (const st of this.topo.stations) {
+      const g = this.geoms[st.idx], room = st.room;
+      const fillMat = new THREE.MeshBasicMaterial({ color: CONFIG.levelColors[2], transparent: true, opacity: 0, depthWrite: false });
+      const fill = new THREE.Mesh(new THREE.PlaneGeometry(room.w, room.d).rotateX(-Math.PI / 2), fillMat);
+      fill.position.set(g.cx, 0.08, g.cz); fill.userData = { stationIdx: st.idx }; fill.renderOrder = 1;
+      const borderMat = new THREE.MeshBasicMaterial({ color: CONFIG.levelColors[0] });
+      const bw = 0.22, parts = [
+        new THREE.BoxGeometry(room.w, 0.05, bw).translate(0, 0, -room.d / 2), new THREE.BoxGeometry(room.w, 0.05, bw).translate(0, 0, room.d / 2),
+        new THREE.BoxGeometry(bw, 0.05, room.d).translate(-room.w / 2, 0, 0), new THREE.BoxGeometry(bw, 0.05, room.d).translate(room.w / 2, 0, 0)];
+      const border = new THREE.Mesh(mergeGeometries(parts, false), borderMat);
+      border.position.set(g.cx, 0.09, g.cz);
+      this.scene.add(fill, border);
+      this.overlays[st.idx] = { fill, border, level: -1 };
+      this.pickables.push(fill);
+    }
+  }
+
+  buildLabels() {
+    this.labels = { clinic: {}, station: {}, building: {} };
+    const mk = (cls, x, y, z) => { const el = document.createElement('div'); el.className = 'lbl ' + cls; const o = new CSS2DObject(el); o.position.set(x, y, z); this.scene.add(o); return el; };
+    for (const b of Object.values(this.topo.buildings)) {
+      const name = b.id === 'ER' ? t('erName') : `${b.id} · ${(CONFIG.buildings.find(x => x.id === b.id) || {}).nameTh || ''}`;
+      this.labels.building[b.id] = mk('bld', b.x - b.w / 2 + 8, 4.5, b.z - b.d / 2);
+      this.labels.building[b.id].textContent = name;
+    }
+    for (const c of CONFIG.clinics) {
+      const st = this.topo.get(c.building, c.id, 'doctor'); if (!st) continue;
+      const g = this.geoms[st.idx];
+      this.labels.clinic[c.id] = mk('clinic', g.cx, 4.2, g.cz);
+    }
+    for (const st of this.topo.stations) {
+      if (st.stage === 'doctor') continue;
+      const g = this.geoms[st.idx];
+      const el = mk(st.clinicId && st.stage !== 'er' ? 'small' : st.stage === 'er' ? '' : 'station', g.cx, st.clinicId ? 2.2 : 3.2, g.z0 + 0.6);
+      el.dataset.base = st.room.label || (st.stage === 'er' ? t('erName') : st.stage.startsWith('pharm') ? `${t('pharmacy')} · ${t('stage.' + st.stage)}` : t('stage.' + st.stage));
+      el.textContent = el.dataset.base;
+      this.labels.station[st.idx] = el;
+    }
+  }
+
+  levelHtml(lv) { return `<span class="lv lvl l${lv}">${t('levelIcon')[lv]} ${t('level')[lv]}</span>`; }
+
+  /** Low-frequency label/overlay text update (UI rate). */
+  updateLabels(snap) {
+    for (const c of CONFIG.clinics) {
+      const el = this.labels.clinic[c.id]; if (!el) continue;
+      const cs = snap.clinicStats[c.id];
+      el.innerHTML = `${c.nameTh} · ${t('persons', { n: cs.total })}${this.levelHtml(cs.level)}`;
+      el.classList.toggle('red', cs.level === 2); el.classList.toggle('pulse', cs.level === 2 && !this.reduced);
+    }
+    for (const st of this.topo.stations) {
+      const el = this.labels.station[st.idx]; if (!el) continue;
+      const ss = snap.stationStats[st.id];
+      if (!st.clinicId || st.stage === 'er') { el.innerHTML = `${el.dataset.base} · ${t('persons', { n: ss.waiting + ss.service })}${this.levelHtml(ss.level)}`; el.classList.toggle('red', ss.level === 2); el.classList.toggle('pulse', ss.level === 2 && !this.reduced); }
+    }
+    this.container.classList.toggle('zoomed-out', this.camera.zoom < CONFIG.render.labelZoomMin);
+  }
+
+  posOfService(stIdx, server) {
+    const g = this.geoms[stIdx]; const sp = g.service[Math.max(0, server)] || { x: g.cx, z: g.z0 + 1 };
+    return sp;
+  }
+  posOfQueue(a) {
+    const g = this.geoms[a.stationIdx];
+    if (a.seat >= 0 && a.seat < g.seats.length) return { ...g.seats[a.seat], seated: true };
+    const k = a.seat >= g.seats.length ? a.seat - g.seats.length : 0;
+    return { ...g.standing(a.line >= 0 ? a.line + k : k), seated: false };
+  }
+  /** Walk path via the building corridor: from → corridor → to. Returns point at fraction f. */
+  pathPoint(from, to, building, f) {
+    const b = this.topo.buildings[building];
+    const cz = b.z + (b.corridorZ ?? 0);
+    const pts = [from, { x: from.x, z: cz }, { x: to.x, z: cz }, to];
+    const seg = [];
+    let L = 0;
+    for (let i = 0; i < 3; i++) { const d = Math.hypot(pts[i + 1].x - pts[i].x, pts[i + 1].z - pts[i].z); seg.push(d); L += d; }
+    let s = f * L;
+    for (let i = 0; i < 3; i++) { if (s <= seg[i] || i === 2) { const u = seg[i] ? Math.min(1, s / seg[i]) : 1; return { x: pts[i].x + (pts[i + 1].x - pts[i].x) * u, z: pts[i].z + (pts[i + 1].z - pts[i].z) * u }; } s -= seg[i]; }
+    return to;
+  }
+  targetOf(a) {
+    const b = this.topo.buildings[a.building];
+    if (a.state === 'service') return { ...this.posOfService(a.stationIdx, a.server), seated: true };
+    if (a.state === 'exit') {
+      const from = this.posOfService(a.fromStationIdx, a.fromServer);
+      const ex = { x: b.x + b.exit.x, z: b.z + b.exit.z + 3 };
+      return { ...this.pathPoint(from, ex, a.building, a.walkT), seated: false, walking: true };
+    }
+    const q = this.posOfQueue(a);
+    if (a.state === 'walk') {
+      const from = a.fromStationIdx >= 0 ? this.posOfService(a.fromStationIdx, a.fromServer) : { x: b.x + b.entrance.x, z: b.z + b.entrance.z + 2 };
+      return { ...this.pathPoint(from, q, a.building, a.walkT), seated: false, walking: true };
+    }
+    return q;
+  }
+
+  /** Per-frame: place up to maxAgents instances. Returns number rendered. */
+  updateAgents(snap, dtReal, jump) {
+    const N = CONFIG.render.maxAgents, vb = this.visibleBuilding;
+    const list = snap.agents;
+    let chosen = list;
+    if (list.length > N) {
+      chosen = list.slice().sort((x, y) => ((vb !== 'ALL' && x.building !== vb) - (vb !== 'ALL' && y.building !== vb)) || (x.rank - y.rank)).slice(0, N);
+    }
+    const mtx = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), s = new THREE.Vector3(1, 1, 1);
+    const col = new THREE.Color();
+    const k = 1 - Math.exp(-dtReal * 10);
+    const D = CONFIG.density;
+    let ri = 0;
+    const seen = this.frameId = (this.frameId || 0) + 1;
+    for (let i = 0; i < chosen.length; i++) {
+      const a = chosen[i];
+      const tg = this.targetOf(a);
+      let sm = this.smooth.get(a.id);
+      if (!sm || jump || Math.hypot(sm.x - tg.x, sm.z - tg.z) > 12 || tg.walking) { sm = { x: tg.x, z: tg.z }; this.smooth.set(a.id, sm); }
+      else { sm.x += (tg.x - sm.x) * k; sm.z += (tg.z - sm.z) * k; }
+      sm.f = seen;
+      const bob = tg.walking ? Math.abs(Math.sin((sm.x + sm.z) * 3)) * 0.06 : 0;
+      p.set(sm.x, (tg.seated ? 0.12 : 0.03) + bob, sm.z);
+      s.set(1, tg.seated ? 0.82 : 1, 1);
+      mtx.compose(p, q, s); this.agentMesh.setMatrixAt(i, mtx);
+      if (this.colorMode === 'stage') col.copy(this.stageCol[a.stage] || this.stageCol.exit);
+      else col.copy(this.levelCol[a.state === 'service' || a.state === 'exit' ? 0 : a.waitMin > D.waitRed ? 2 : a.waitMin >= D.waitYellow ? 1 : 0]);
+      this.agentMesh.setColorAt(i, col);
+      if ((a.state === 'wait' || a.state === 'walk') && a.waitMin > D.waitRed) { mtx.makeTranslation(sm.x, 0.0, sm.z); this.ringMesh.setMatrixAt(ri++, mtx); }
+    }
+    this.agentMesh.count = chosen.length; this.ringMesh.count = ri;
+    this.agentMesh.instanceMatrix.needsUpdate = true; this.agentMesh.instanceColor.needsUpdate = true; this.ringMesh.instanceMatrix.needsUpdate = true;
+    if (seen % 120 === 0) for (const [id, v] of this.smooth) if (v.f !== seen) this.smooth.delete(id);
+    return chosen.length;
+  }
+
+  updateOverlays(snap, timeSec) {
+    const pulse = this.reduced ? 0.28 : 0.16 + 0.2 * (0.5 + 0.5 * Math.sin(timeSec * 4));
+    for (const st of this.topo.stations) {
+      const o = this.overlays[st.idx], lv = snap.stationStats[st.id].level;
+      if (o.level !== lv) { o.border.material.color.set(CONFIG.levelColors[lv]); o.level = lv; }
+      o.fill.material.opacity = lv === 2 ? pulse : 0;
+    }
+  }
+
+  pick(clientX, clientY) {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    this.pointer.set(((clientX - r.left) / r.width) * 2 - 1, -((clientY - r.top) / r.height) * 2 + 1);
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    const hit = this.raycaster.intersectObjects(this.pickables, false)[0];
+    return hit ? hit.object.userData.stationIdx : null;
+  }
+
+  resize() {
+    const W = this.container.clientWidth || 1, H = this.container.clientHeight || 1, fh = CONFIG.render.frustumH, a = W / H;
+    Object.assign(this.camera, { left: -fh * a / 2, right: fh * a / 2, top: fh / 2, bottom: -fh / 2 });
+    this.camera.updateProjectionMatrix();
+    this.renderer.setSize(W, H); this.labelRenderer.setSize(W, H);
+  }
+
+  render(nowMs) {
+    if (this.fly) {
+      const f = this.fly, u = f.dur > 0 ? Math.min(1, (nowMs - f.t0) / f.dur) : 1, e = u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2;
+      const x = f.from.x + (f.to.x - f.from.x) * e, z = f.from.z + (f.to.z - f.from.z) * e;
+      this.controls.target.set(x, 0, z); this.camera.position.set(x, 0, z).add(f.off);
+      this.camera.zoom = f.from.zoom + (f.to.zoom - f.from.zoom) * e; this.camera.updateProjectionMatrix();
+      if (u >= 1) this.fly = null;
+    }
+    this.controls.update();
+    this.renderer.render(this.scene, this.camera);
+    this.labelRenderer.render(this.scene, this.camera);
+  }
+}
+
+// ===== 8. UI OVERLAY =====
+const $ = (sel, root = document) => root.querySelector(sel);
+const h = (html) => { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstElementChild; };
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const lvlHtml = (lv) => `<span class="lvl l${lv}">${I18N.levelIcon[lv]} ${I18N.level[lv]}</span>`;
+let toastTimer = 0;
+function toast(msg) { const el = $('#toast'); el.textContent = msg; el.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 2600); }
+const clinicName = (id) => (CONFIG.clinics.find(c => c.id === id) || {}).nameTh || id;
+const buildingName = (id) => (CONFIG.buildings.find(b => b.id === id) || {}).nameTh || id;
+
+/** Date pickers (day / Thai month / พ.ศ. year) + ค้นหา + ตอนนี้ */
+function datePickerHtml() {
+  const days = Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}">${i + 1}</option>`).join('');
+  const months = I18N.months.map((m, i) => `<option value="${i + 1}">${m}</option>`).join('');
+  const yNow = Number(bangkokNow().date.slice(0, 4));
+  const years = Array.from({ length: CONFIG.replay.minYearsBack + 1 }, (_, i) => yNow - i).map(y => `<option value="${y}">${y + 543}</option>`).join('');
+  return `<div class="grp"><select id="selD" aria-label="${t('dayLabel')}">${days}</select><select id="selM" aria-label="${t('monthLabel')}">${months}</select>
+    <select id="selY" aria-label="${t('yearLabel')}">${years}</select><button class="btn primary" id="btnSearch">${t('search')}</button>
+    <button class="btn" id="btnNow">${t('now')}</button></div>`;
+}
+
+class CommandUI {
+  constructor(app) {
+    this.app = app;
+    const ui = $('#ui');
+    ui.innerHTML = `
+      <div id="topbar" class="card">
+        <div><h1>${t('appTitle')}</h1><div class="sub muted">${t('appSub')}</div></div>
+        <div class="seg" id="bldSeg">${['ALL', ...CONFIG.buildings.map(b => b.id)].map(id => `<button data-b="${id}">${id === 'ALL' ? t('overview') : id}</button>`).join('')}</div>
+        <select id="clinicSel"></select>
+        <div class="spacer"></div>
+        <span id="modePill" class="pill"></span>
+        <div><div id="clock"></div><div id="dateTh" class="muted" style="font-size:12px"></div></div>
+      </div>
+      <div id="leftCol"><div id="kpiPanel" class="card"></div><div id="legend" class="card"></div></div>
+      <div id="alertPanel" class="card"><h2>${t('alertsTitle')}</h2><div id="alerts"></div><h2 style="margin-top:12px">${t('suggestTitle')}</h2><div id="suggs"></div></div>
+      <div id="timebar" class="card">${datePickerHtml()}
+        <div class="grp" id="replayCtl"><button class="btn" id="btnPlay"></button>
+          <input type="range" id="slider" min="${CONFIG.day.open}" max="${CONFIG.day.close}" step="1">
+          <div class="seg" id="speedSeg">${CONFIG.replay.speeds.map(s => `<button data-s="${s}">x${s}</button>`).join('')}</div></div>
+      </div>
+      <div id="detail" class="card hidden"></div>
+      <div id="ooh" class="hidden"><div class="card"><h2>${t('outOfHours')}</h2><div class="muted" id="oohText"></div>
+        <div style="margin-top:12px"><button class="btn primary" id="btnOohReplay"></button></div></div></div>`;
+    $('#bldSeg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) app.selectBuilding(b.dataset.b); });
+    $('#clinicSel').addEventListener('change', (e) => { const v = e.target.value; if (v) app.selectTarget(v); e.target.value = ''; });
+    $('#btnSearch').addEventListener('click', () => app.searchDate(Number($('#selD').value), Number($('#selM').value), Number($('#selY').value)));
+    $('#btnNow').addEventListener('click', () => app.time.goLive());
+    $('#btnPlay').addEventListener('click', () => app.time.togglePlay());
+    $('#slider').addEventListener('input', (e) => app.time.seek(Number(e.target.value)));
+    $('#speedSeg').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) app.time.setSpeed(Number(b.dataset.s)); });
+    $('#btnOohReplay').addEventListener('click', () => app.time.goReplay(app.time.lastServiceDay(), CONFIG.replay.startMin));
+    $('#alerts').addEventListener('click', (e) => { const a = e.target.closest('.alert'); if (a) app.selectTarget(a.dataset.target); });
+    $('#legend').addEventListener('click', (e) => { const b = e.target.closest('button[data-c]'); if (b) { app.scene3d.colorMode = b.dataset.c; this.renderLegend(); } });
+    this.renderLegend();
+    this.syncDateSelects(app.time.date);
+  }
+  syncDateSelects(iso) { const [y, m, d] = iso.split('-').map(Number); $('#selD').value = d; $('#selM').value = m; $('#selY').value = y; }
+  renderLegend() {
+    const mode = this.app.scene3d.colorMode, D = CONFIG.density;
+    const rows = mode === 'stage'
+      ? CONFIG.stageOrder.map(s => `<div class="row"><span class="sw" style="background:${CONFIG.stageColors[s]}"></span>${t('stage.' + s)}</div>`).join('')
+      : [0, 1, 2].map(i => `<div class="row"><span class="sw" style="background:${CONFIG.levelColors[i]}"></span>${I18N.levelIcon[i]} ${t('waitBand')[i].replace('{a}', D.waitYellow).replace('{b}', D.waitRed)}</div>`).join('');
+    $('#legend').innerHTML = `<div class="seg" style="margin-bottom:6px"><button data-c="stage" class="${mode === 'stage' ? 'on' : ''}">${t('colorByStage')}</button><button data-c="wait" class="${mode === 'wait' ? 'on' : ''}">${t('colorByWait')}</button></div>
+      <div class="cols">${rows}</div><div class="row" style="margin-top:4px"><span class="ring"></span>${t('ringLegend', { n: D.waitRed })}</div>
+      <div class="row" style="margin-top:4px;gap:8px;flex-wrap:wrap"><span class="muted">${t('levelLegend')}</span>${[0, 1, 2].map(lvlHtml).join('')}</div>`;
+  }
+  update(snap) {
+    const app = this.app, scope = app.building, k = snap.kpis[scope] || snap.kpis.ALL, time = app.time;
+    $('#clock').textContent = fmtTime(time.simTime);
+    $('#dateTh').textContent = fmtDateTh(time.date);
+    const pill = $('#modePill'); pill.className = 'pill ' + time.mode; pill.innerHTML = `<span class="dot"></span>${time.mode === 'live' ? t('live') : t('replay')}`;
+    for (const b of $('#bldSeg').children) b.classList.toggle('on', b.dataset.b === scope);
+    $('#replayCtl').classList.toggle('hidden', time.mode !== 'replay');
+    $('#btnPlay').textContent = time.playing ? t('pause') : t('play');
+    if (document.activeElement !== $('#slider')) $('#slider').value = Math.floor(time.simTime);
+    for (const b of $('#speedSeg').children) b.classList.toggle('on', Number(b.dataset.s) === time.speed);
+    // out of hours
+    const ooh = time.mode === 'live' && time.outOfHours();
+    $('#ooh').classList.toggle('hidden', !ooh);
+    if (ooh) { $('#oohText').textContent = t('outOfHoursDetail', { open: fmtTime(CONFIG.day.open).replace(' น.', ''), close: fmtTime(CONFIG.day.close).replace(' น.', '') });
+               $('#btnOohReplay').textContent = t('viewReplay', { date: fmtDateTh(time.lastServiceDay()) }); }
+    // clinic dropdown
+    const sel = $('#clinicSel');
+    const opts = [`<option value="">${t('selectClinic')}</option>`,
+      ...CONFIG.clinics.filter(c => scope === 'ALL' || c.building === scope).map(c => `<option value="clinic:${c.id}">${esc(t('clinicOption', { name: c.nameTh, n: snap.clinicStats[c.id].total }))}</option>`),
+      ...(scope === 'ALL' && snap.er ? [`<option value="er">${esc(t('clinicOption', { name: t('erName'), n: snap.er.present }))}</option>`] : [])].join('');
+    if (sel.dataset.html !== opts && document.activeElement !== sel) { sel.innerHTML = opts; sel.dataset.html = opts; }
+    // KPIs
+    const st = CONFIG.stageOrder.map(s => `<tr><td><span class="sw" style="background:${CONFIG.stageColors[s]}"></span>${t('stage.' + s)}</td><td class="n">${k.waitingByStage[s]} / ${k.serviceByStage[s]}</td></tr>`).join('');
+    $('#kpiPanel').innerHTML = `<h2>${t('kpiTitle')} · ${scope === 'ALL' ? t('overview') : buildingName(scope)}</h2>
+      <div class="kgrid">
+        <div class="kbox"><div class="v" id="kTotal">${k.total.toLocaleString('th-TH')}</div><div class="l">${t('kpiTotal')}</div></div>
+        <div class="kbox"><div class="v">${Math.round(k.avgWait)}</div><div class="l">${t('kpiAvgWait')}</div></div>
+        <div class="kbox"><div class="v" style="color:${k.overThreshold ? 'var(--red)' : 'inherit'}">${k.overThreshold}</div><div class="l">${t('kpiOver', { n: CONFIG.density.waitRed })}</div></div>
+        <div class="kbox"><div class="v">${k.throughputHr}</div><div class="l">${t('kpiThroughput')}</div></div>
+        <div class="kbox"><div class="v">${Math.round(k.pctClinicsRed)}%</div><div class="l">${t('kpiPctRed')} (${k.clinicsRed}/${k.clinicsTotal})</div></div>
+        <div class="kbox"><div class="v">${k.arrivedToday.toLocaleString('th-TH')}</div><div class="l">${t('kpiArrived')}</div></div>
+      </div>
+      <div class="muted" style="font-size:12px;margin-bottom:4px">${t('kpiWaitingByStage')}</div>
+      <table class="stages">${st}</table>
+      <div class="muted" style="font-size:12px;margin:8px 0 4px">${t('kpiPharmSplit')}</div>
+      <table class="stages"><tr><td></td><td class="n muted">${t('kpiPharmNow')}</td><td class="n muted">${t('kpiPharmServed')}</td></tr>
+        <tr><td>${t('stage.pharmHosp')}</td><td class="n">${k.pharmHospNow}</td><td class="n">${k.pharmHospServed}</td></tr>
+        <tr><td>${t('stage.pharmHome')}</td><td class="n">${k.pharmHomeNow}</td><td class="n">${k.pharmHomeServed}</td></tr></table>`;
+    // alerts + suggestions
+    const { alerts, suggestions } = ALERTS.evaluate(snap, scope, app.topo);
+    $('#alerts').innerHTML = alerts.length ? alerts.map(a => `<div class="alert" data-target="${a.kind === 'clinic' ? 'clinic:' + a.clinicId : a.kind === 'er' ? 'er' : 'station:' + a.stationId}">
+        <div class="t">${I18N.levelIcon[2]} ${esc(a.title)} <span class="lvl l2">${I18N.level[2]}</span></div><div class="b">${esc(a.body)}</div>
+        <div class="b muted">${t('alertRedFor', { n: a.redForMin })}</div></div>`).join('') : `<div class="empty">${t('noAlerts')}</div>`;
+    $('#suggs').innerHTML = suggestions.length ? suggestions.map(s => `<div class="sugg">${esc(s.text)}</div>`).join('') : `<div class="empty">${t('noSuggest')}</div>`;
+    this.renderDetail(snap);
+  }
+  renderDetail(snap) {
+    const sel = this.app.selected, el = $('#detail');
+    if (!sel) { el.classList.add('hidden'); return; }
+    el.classList.remove('hidden');
+    const row = (ss, label) => `<tr><td>${label}</td><td class="n">${ss.waiting}</td><td class="n">${ss.service}/${ss.servers}</td>
+      <td class="n">${Math.round(ss.occ * 100)}%</td><td class="n">${Math.round(ss.avgWait)}</td><td class="n">${lvlHtml(ss.level)}</td></tr>`;
+    const head = `<tr class="muted"><td>${t('detailStage')}</td><td class="n">${t('detailWaiting')}</td><td class="n">${t('detailService')}</td><td class="n">${t('detailOcc')}</td><td class="n">${t('detailWait')}</td><td class="n">${t('detailLevel')}</td></tr>`;
+    let html = '';
+    if (sel.type === 'clinic') {
+      const cs = snap.clinicStats[sel.id];
+      html = `<h3>${esc(cs.nameTh)}</h3><div class="muted">${esc(buildingName(cs.building))}</div>
+        <div class="kgrid" style="margin-top:8px"><div class="kbox"><div class="v">${cs.total}</div><div class="l">${t('detailTotal')}</div></div>
+        <div class="kbox"><div class="v">${cs.throughputHr}</div><div class="l">${t('detailThroughput')}</div></div>
+        <div class="kbox"><div class="v">${Math.round(cs.avgWait)}</div><div class="l">${t('kpiAvgWait')}</div></div>
+        <div class="kbox"><div class="v" style="font-size:16px">${lvlHtml(cs.level)}</div><div class="l">${cs.level === 2 ? t('detailRedFor') + ' ' + t('minutes', { n: cs.redForMin }) : t('detailLevel')}</div></div></div>
+        <table class="stages">${head}${CONFIG.clinicStages.map(s => cs.stages[s] ? row(cs.stages[s], t('stageWait.' + s)) : '').join('')}</table>`;
+    } else {
+      const ss = sel.type === 'er' ? snap.er : snap.stationStats[sel.id];
+      const title = sel.type === 'er' ? t('erName') : t('stage.' + ss.stage);
+      html = `<h3>${esc(title)}</h3><div class="muted">${sel.type === 'er' ? '' : esc(buildingName(ss.building)) + ' · ' + t('shared')}</div>
+        <table class="stages" style="margin-top:8px">${head}${row(ss, t('stageWait.' + ss.stage))}</table>
+        ${ss.level === 2 ? `<div class="muted" style="margin-top:6px">${t('detailRedFor')} ${t('minutes', { n: ss.redForMin })}</div>` : ''}`;
+    }
+    el.innerHTML = `<button class="close" aria-label="close">×</button>${html}`;
+    $('.close', el).onclick = () => { this.app.selected = null; el.classList.add('hidden'); };
+  }
+}
+
+class TvUI {
+  constructor(app) {
+    this.app = app;
+    document.body.classList.add('tv');
+    $('#ui').innerHTML = `
+      <div id="tvHeader" class="card"><div class="t">${t('appTitle')}</div><div class="c" id="tvClock"></div><div class="muted" id="tvDate" style="font-size:26px"></div></div>
+      <div id="tvBoard" class="card"></div>
+      <div id="tvFocus" class="card"></div>
+      <div id="ticker"><div class="lab">${t('tvCallTitle')}</div><div class="track" id="tickTrack"></div></div>
+      <div id="ooh" class="hidden"><div class="card"><h2>${t('outOfHours')}</h2><div class="muted" id="oohText" style="font-size:28px"></div></div></div>`;
+    this.tickKey = '';
+  }
+  update(snap) {
+    const time = this.app.time, k = snap.kpis.ALL;
+    $('#tvClock').textContent = fmtTime(time.simTime);
+    $('#tvDate').textContent = fmtDateTh(time.date) + (time.mode === 'replay' ? ' · ' + t('replay') : '');
+    $('#tvBoard').innerHTML = `
+      <div class="r"><span>${t('tvInBuilding')}</span><b>${k.total.toLocaleString('th-TH')}</b></div>
+      <div class="r"><span>${t('tvWaiting')}</span><b>${k.waiting.toLocaleString('th-TH')}</b></div>
+      <div class="r"><span>${t('tvAvgWait')}</span><b>${t('minutes', { n: Math.round(k.avgWait) })}</b></div>
+      <div class="r"><span>${t('tvRedClinics')}</span><b>${k.clinicsRed}/${k.clinicsTotal}</b></div>`;
+    const cid = this.app.tourClinic;
+    if (cid) {
+      const cs = snap.clinicStats[cid];
+      $('#tvFocus').innerHTML = `<div class="n">${esc(cs.nameTh)} ${lvlHtml(cs.level)}</div>
+        <div class="s">${t('tvWaiting')} ${t('persons', { n: cs.waiting })} · ${t('tvAvgWait')} ${t('minutes', { n: Math.round(cs.avgWait) })}</div>`;
+    }
+    const calls = snap.recentCalls.slice(0, 8).map(c => t(c.kind === 'doctor' ? 'callDoctor' : c.kind === 'lab' ? 'callLab' : 'callPharm', { q: c.queueNo, room: c.room }));
+    const key = calls.join('|');
+    if (key !== this.tickKey) { this.tickKey = key; $('#tickTrack').innerHTML = (calls.length ? calls : [t('noCalls')]).map(s => `<span>${esc(s)}</span>`).join(''); }
+    const ooh = time.oohReplay;
+    $('#ooh').classList.toggle('hidden', !ooh);
+    if (ooh) $('#oohText').textContent = t('outOfHoursDetail', { open: fmtTime(CONFIG.day.open).replace(' น.', ''), close: fmtTime(CONFIG.day.close).replace(' น.', '') }) + ' · ' + t('tvReplayNote', { date: fmtDateTh(time.date) });
+  }
+}
+
+class MobileUI {
+  constructor(app) {
+    this.app = app;
+    document.body.classList.add('mobile');
+    const ui = $('#ui');
+    ui.innerHTML = `<div id="mob">
+      <h1>${t('mobTitle')}</h1><div class="muted">${t('mobSub')}</div>
+      <div class="card"><div class="inrow"><input type="text" id="qIn" inputmode="text" autocomplete="off" placeholder="${t('mobPlaceholder')}" maxlength="8">
+        <button class="btn primary" id="qBtn">${t('mobCheck')}</button></div>
+        <div class="muted" style="margin-top:8px;font-size:13px">${t('mobTry')}</div><div class="chips" id="qChips"></div></div>
+      <div class="card hidden" id="qRes"></div>
+      <div id="oohSlot"></div>
+      <div style="margin-top:12px"><button class="btn" id="btn3d">${t('mobShow3d')}</button></div>
+      <div id="sceneSlot"></div>
+      <div class="muted" style="font-size:12px;margin-top:8px" id="mobFoot"></div></div>`;
+    // move the persistent 3D container + out-of-hours card into the mobile flow
+    const sc = $('#scene'); $('#sceneSlot').appendChild(sc); sc.classList.add('hidden');
+    $('#oohSlot').appendChild(h(`<div id="ooh" class="hidden"><div class="card"><h2>${t('outOfHours')}</h2><div class="muted" id="oohText"></div>
+      <div style="margin-top:12px"><button class="btn primary" id="btnOohReplay"></button></div></div></div>`));
+    $('#btnOohReplay').addEventListener('click', () => app.time.goReplay(app.time.lastServiceDay(), 570, 1));
+    $('#qBtn').addEventListener('click', () => this.check());
+    $('#qIn').addEventListener('keydown', (e) => { if (e.key === 'Enter') this.check(); });
+    $('#qChips').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) { $('#qIn').value = b.textContent; this.check(); } });
+    $('#btn3d').addEventListener('click', () => {
+      const hidden = sc.classList.toggle('hidden');
+      $('#btn3d').textContent = hidden ? t('mobShow3d') : t('mobHide3d');
+      app.show3d = !hidden; if (!hidden) { app.scene3d.resize(); if (this.last && this.last.clinicId) app.scene3d.focusClinic(this.last.clinicId); }
+    });
+    this.query = '';
+    this.chipKey = '';
+  }
+  check() { this.query = $('#qIn').value.trim().toUpperCase(); this.renderResult(); }
+  renderResult() {
+    const el = $('#qRes');
+    if (!this.query) { el.classList.add('hidden'); return; }
+    el.classList.remove('hidden');
+    const r = this.app.adapter.lookupQueue(this.query, this.app.time.simTime);
+    this.last = r;
+    const q = esc(this.query);
+    if (!r.found) { el.innerHTML = `<div>${t('mobNotFound', { q })}</div>`; return; }
+    if (r.status === 'notArrived') { el.innerHTML = `<div>${t('mobNotArrived', { q })}</div>`; return; }
+    if (r.status === 'done') { el.innerHTML = `<div>${t('mobDone', { q })}</div>`; return; }
+    const stTxt = r.status === 'service' ? t('mobInService') : r.status === 'walk' ? t('mobWalking') : t('mobWaiting');
+    const steps = r.route.map((s, i) => `<span class="${i < r.stageIndex ? 'done' : i === r.stageIndex ? 'cur' : ''}">${t('stage.' + s)}</span>`).join('');
+    el.innerHTML = `<div style="font-size:22px;font-weight:700">${q}</div>
+      <div class="muted">${esc(t('mobLocation', { clinic: clinicName(r.clinicId), bld: buildingName(r.building) }))}</div>
+      <div style="margin-top:10px" class="muted">${t('mobCurrent')}</div>
+      <div style="font-size:20px;font-weight:700">${t('stage.' + r.stage)} · ${stTxt}</div>
+      <div class="two"><div class="kbox"><div class="l">${t('mobAhead')}</div><div class="big">${r.ahead}</div></div>
+        <div class="kbox"><div class="l">${t('mobEta')}</div><div class="big">${r.etaMin}</div><div class="l">${t('minutes', { n: '' }).trim()}</div></div></div>
+      <div class="muted" style="margin-top:6px">${t('mobWaited')} ${t('minutes', { n: Math.round(r.waitedMin) })}</div>
+      <div class="steps">${steps}</div>
+      <div class="muted" style="font-size:12px;margin-top:8px">${t('mobEtaNote')}</div>`;
+  }
+  update(snap) {
+    const time = this.app.time;
+    const ooh = time.mode === 'live' && time.outOfHours();
+    $('#ooh').classList.toggle('hidden', !ooh);
+    if (ooh) { $('#oohText').textContent = t('outOfHoursDetail', { open: fmtTime(CONFIG.day.open).replace(' น.', ''), close: fmtTime(CONFIG.day.close).replace(' น.', '') });
+               $('#btnOohReplay').textContent = t('viewReplay', { date: fmtDateTh(time.lastServiceDay()) }); }
+    const chips = this.app.adapter.sampleQueues(time.simTime, 4);
+    const key = chips.join(',');
+    if (key !== this.chipKey && (!this.chipT || performance.now() - this.chipT > 15000)) { this.chipKey = key; this.chipT = performance.now(); $('#qChips').innerHTML = chips.map(c => `<button>${c}</button>`).join(''); }
+    $('#mobFoot').textContent = `${fmtDateTh(time.date)} · ${t('mobUpdated', { t: fmtTime(time.simTime) })}` + (time.mode === 'replay' ? ' · ' + t('replay') : '');
+    this.renderResult();
+  }
+}
+
+// ===== 9. MODES =====
+function bangkokNow() {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', { timeZone: CONFIG.timezone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).formatToParts(new Date()).map(p => [p.type, p.value]));
+  return { date: `${parts.year}-${parts.month}-${parts.day}`, min: (Number(parts.hour) % 24) * 60 + Number(parts.minute) + Number(parts.second) / 60 };
+}
+const addDays = (iso, n) => { const [y, m, d] = iso.split('-').map(Number); const dt = new Date(Date.UTC(y, m - 1, d + n)); return dt.toISOString().slice(0, 10); };
+
+class TimeController {
+  constructor(adapter, params) {
+    this.adapter = adapter;
+    this.clockOverride = params.get('clock');      // debug/testing: ?clock=HH:MM fakes Bangkok wall-clock
+    this.speed = CONFIG.replay.defaultSpeed;
+    this.playing = false;
+    this.oohReplay = false;
+    const pd = params.get('date');
+    if (pd && /^\d{4}-\d{2}-\d{2}$/.test(pd) && pd < this.now().date) this.goReplay(pd, CONFIG.replay.startMin);
+    else this.goLive();
+  }
+  now() {
+    const n = bangkokNow();
+    if (this.clockOverride && /^\d{1,2}:\d{2}$/.test(this.clockOverride)) { const [hh, mm] = this.clockOverride.split(':').map(Number); n.min = hh * 60 + mm + ((performance.now() / 60000) % 1); }
+    return n;
+  }
+  outOfHours() { return this.simTime < CONFIG.day.open || this.simTime >= CONFIG.day.close; }
+  lastServiceDay() { const n = this.now(); let d = n.min >= CONFIG.day.close ? n.date : addDays(n.date, -1); while (isWeekend(d)) d = addDays(d, -1); return d; }
+  goLive() {
+    const n = this.now();
+    this.mode = 'live'; this.playing = true; this.oohReplay = false;
+    this.date = n.date; this.simTime = n.min;
+    this.adapter.setDate(this.date); this.adapter.setMode('live');
+    this.onChange && this.onChange('live');
+  }
+  goReplay(date, startMin, speed) {
+    this.mode = 'replay'; this.date = date; this.simTime = startMin ?? CONFIG.replay.startMin; this.playing = true;
+    if (speed) this.speed = speed;
+    this.adapter.setDate(date); this.adapter.setMode('replay');
+    this.onChange && this.onChange('replay');
+  }
+  togglePlay() { if (this.mode === 'replay') { if (!this.playing && this.simTime >= CONFIG.day.close) this.simTime = CONFIG.day.open; this.playing = !this.playing; } }
+  seek(min) { if (this.mode === 'replay') this.simTime = Math.max(CONFIG.day.open, Math.min(CONFIG.day.close, min)); this.jumped = true; }
+  setSpeed(s) { this.speed = s; }
+  tick(dtSec) {
+    if (this.mode === 'live') {
+      const n = this.now();
+      if (n.date !== this.date) { this.date = n.date; this.adapter.setDate(n.date); }
+      this.simTime = n.min;
+    } else if (this.playing) {
+      this.simTime += (dtSec * this.speed) / 60;
+      if (this.simTime >= CONFIG.day.close) {
+        if (this.oohReplay) { this.simTime = CONFIG.day.open; this.jumped = true; }   // TV loop
+        else { this.simTime = CONFIG.day.close; this.playing = false; }
+      }
+    }
+  }
+}
+
+class App {
+  constructor() {
+    this.params = new URLSearchParams(location.search);
+    this.uiMode = ['command', 'tv', 'mobile'].includes(this.params.get('mode')) ? this.params.get('mode') : 'command';
+    this.debug = this.params.get('debug') === '1';
+    this.reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    $('#simBadge').textContent = t('simBadge');
+    this.topo = buildTopology(CONFIG, LAYOUT);
+    this.adapter = new SimulatedAdapter(this.topo);       // ← swap for new ApiAdapter(this.topo, url)
+    this.time = new TimeController(this.adapter, this.params);
+    this.building = 'ALL';
+    this.selected = null;
+    this.show3d = this.uiMode !== 'mobile';
+    if (this.uiMode === 'mobile') document.body.classList.add('mobile');
+    this.baseInsets = this.uiMode === 'command' ? { left: 290, right: 320, top: 112, bottom: 80 }
+      : this.uiMode === 'tv' ? { left: 0, right: 470, top: 260, bottom: 100 } : { left: 0, right: 0, top: 0, bottom: 0 };
+    this.scene3d = new OpdScene($('#scene'), this.topo, { interactive: this.uiMode === 'command', reducedMotion: this.reduced, insets: { ...this.baseInsets } });
+    this.ui = this.uiMode === 'tv' ? new TvUI(this) : this.uiMode === 'mobile' ? new MobileUI(this) : new CommandUI(this);
+    this.time.onChange = () => { this.scene3d.smooth.clear(); this.time.jumped = true; if (this.ui.syncDateSelects) this.ui.syncDateSelects(this.time.date); };
+    this.adapter.subscribe(() => { this.time.jumped = true; });
+    if (this.uiMode === 'command') this.bindPicking();
+    if (this.uiMode === 'tv') this.setupTv();
+    if (this.debug) this.debugPanel = new DebugPanel(this);
+    this.lastUi = 0; this.last = performance.now();
+    this.fps = { frames: 0, t0: performance.now(), value: 0 };
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) this.last = performance.now(); });
+    requestAnimationFrame((ts) => this.frame(ts));
+  }
+  /** Date pickers → LIVE (today) or REPLAY (past date). Year is the Gregorian value of the พ.ศ. option. */
+  searchDate(d, m, y) {
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    if (dt.getUTCDate() !== d || dt.getUTCMonth() !== m - 1) { toast(t('invalidDate')); return; }
+    const iso = dt.toISOString().slice(0, 10), today = this.time.now().date;
+    if (iso > today) { toast(t('futureDate')); return; }
+    if (iso === today) this.time.goLive(); else this.time.goReplay(iso, CONFIG.replay.startMin, CONFIG.replay.defaultSpeed);
+  }
+  selectBuilding(id) {
+    this.building = id; this.scene3d.visibleBuilding = id; this.selected = null; this.scene3d.insets = { ...this.baseInsets };
+    this.scene3d.focusBuilding(id);
+  }
+  selectTarget(v) {
+    const [type, id] = v.split(':');
+    if (this.uiMode === 'command') this.scene3d.insets = { ...this.baseInsets, right: this.baseInsets.right + 340 };
+    if (type === 'clinic') {
+      const c = CONFIG.clinics.find(x => x.id === id);
+      if (this.building !== 'ALL' && this.building !== c.building) { this.building = c.building; }
+      this.scene3d.visibleBuilding = c.building; this.selected = { type, id }; this.scene3d.focusClinic(id);
+    } else if (type === 'station') {
+      const st = this.topo.stations.find(s => s.id === id); this.selected = { type, id }; this.scene3d.visibleBuilding = st.building; this.scene3d.focusStation(st.idx);
+    } else if (type === 'er') {
+      const st = this.topo.stations.find(s => s.stage === 'er'); this.selected = { type: 'er', id: st.id }; this.scene3d.focusStation(st.idx);
+    }
+    this.lastUi = 0;
+  }
+  bindPicking() {
+    const el = this.scene3d.renderer.domElement;
+    let down = null;
+    el.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY }; });
+    el.addEventListener('pointerup', (e) => {
+      if (!down || Math.hypot(e.clientX - down.x, e.clientY - down.y) > 5) return;
+      const idx = this.scene3d.pick(e.clientX, e.clientY);
+      if (idx == null) return;
+      const st = this.topo.stations[idx];
+      this.selectTarget(st.stage === 'er' ? 'er' : st.clinicId ? 'clinic:' + st.clinicId : 'station:' + st.id);
+    });
+  }
+  setupTv() {
+    // outside service hours: show notice + auto-loop the last service day
+    if (this.time.mode === 'live' && this.time.outOfHours()) { this.time.goReplay(this.time.lastServiceDay(), CONFIG.day.open + 60, 30); this.time.oohReplay = true; }
+    const order = CONFIG.clinics.map(c => c.id);
+    let i = 0;
+    const step = () => { this.tourClinic = order[i % order.length]; const c = CONFIG.clinics.find(x => x.id === this.tourClinic);
+      this.scene3d.visibleBuilding = c.building; this.scene3d.focusClinic(this.tourClinic); i++; this.lastUi = 0; };
+    step();
+    setInterval(step, (this.reduced ? CONFIG.render.tourSecReduced : CONFIG.render.tourSec) * 1000);
+  }
+  frame(ts) {
+    requestAnimationFrame((t2) => this.frame(t2));
+    if (document.hidden) return;                       // pause rendering when tab hidden
+    const now = performance.now();
+    const dt = Math.min(0.25, (now - this.last) / 1000); this.last = now;
+    this.time.tick(dt);
+    const snap = this.adapter.getSnapshot(this.time.simTime);
+    this.snap = snap;
+    const jump = !!this.time.jumped; this.time.jumped = false;
+    if (this.show3d) {
+      this.rendered = this.scene3d.updateAgents(snap, dt, jump);
+      this.scene3d.updateOverlays(snap, now / 1000);
+    }
+    if (now - this.lastUi > 1000 / CONFIG.render.uiHz) {
+      this.lastUi = now;
+      this.ui.update(snap);
+      if (this.show3d) this.scene3d.updateLabels(snap);
+      if (this.debugPanel) this.debugPanel.update(snap);
+    }
+    if (this.show3d) this.scene3d.render(now);
+    this.fps.frames++;
+    if (now - this.fps.t0 > 1000) { this.fps.value = (this.fps.frames * 1000) / (now - this.fps.t0); this.fps.frames = 0; this.fps.t0 = now; }
+  }
+}
+
+// ===== 10. DEBUG =====
+class DebugPanel {
+  constructor(app) {
+    this.app = app;
+    const el = h(`<div id="debug" class="card"><b>${t('dbgTitle')}</b> · <span class="fps" id="dbgFps"></span> FPS
+      <div>${t('dbgSeed')}: <code id="dbgSeed"></code> · agents <span id="dbgAgents"></span></div>
+      <div class="muted" style="margin-top:4px">${t('dbgSurge', { n: CONFIG.debug.surgePatients })}</div>
+      <div class="surges">${CONFIG.clinics.map(c => `<button class="btn" data-c="${c.id}">${c.nameTh}</button>`).join('')}</div>
+      <div style="margin-top:6px"><button class="btn" id="dbgClear">${t('dbgClear')}</button></div>
+      <div class="muted" style="margin-top:6px">${t('dbgSelfTest')}: <span id="dbgTest"></span></div></div>`);
+    document.body.appendChild(el);
+    el.querySelector('.surges').addEventListener('click', (e) => { const b = e.target.closest('button'); if (!b) return;
+      app.adapter.forceSurge(b.dataset.c, app.time.simTime); toast(t('surgeToast', { n: CONFIG.debug.surgePatients, name: clinicName(b.dataset.c) })); });
+    $('#dbgClear').addEventListener('click', () => app.adapter.clearSurges());
+    if (app.uiMode === 'tv') { el.style.fontSize = '16px'; el.style.bottom = '110px'; }
+    if (app.uiMode === 'mobile') { el.style.position = 'static'; el.style.width = 'auto'; el.style.margin = '12px'; }
+    this.kpiOk = true;
+    DebugPanel.determinismTest(app.topo);
+  }
+  /** Spec step 2: run the same date twice and log counts at 09:00 – they must be identical. */
+  static determinismTest(topo) {
+    const date = '2026-10-15';
+    const runs = [0, 1].map(() => { const a = new SimulatedAdapter(topo); a.setDate(date); const s = a.getSnapshot(540);
+      return { visits: a.day.patients.filter(p => !p.isER).length, total: s.kpis.ALL.total, stages: JSON.stringify(s.stageCounts.ALL), ms: Math.round(a.day.ms) }; });
+    const same = runs[0].visits === runs[1].visits && runs[0].stages === runs[1].stages;
+    console.log('[determinism] seed', date, '@09:00 run1', runs[0], 'run2', runs[1], same ? 'IDENTICAL ✓' : 'DIFFERENT ✗');
+    DebugPanel.determinism = same;
+    return same;
+  }
+  update(snap) {
+    $('#dbgFps').textContent = this.app.fps.value.toFixed(0);
+    $('#dbgSeed').textContent = this.app.adapter.getSeed();
+    $('#dbgAgents').textContent = `${this.app.rendered ?? 0}/${snap.agents.length}`;
+    // self-check: KPI totals == sum of stage counts, for every scope
+    for (const [scope, k] of Object.entries(snap.kpis)) {
+      const sum = Object.values(snap.stageCounts[scope]).reduce((a, s) => a + s.waiting + s.service, 0);
+      if (sum !== k.total) { this.kpiOk = false; console.error('[selfcheck] KPI mismatch', scope, sum, k.total); }
+    }
+    $('#dbgTest').textContent = `determinism ${DebugPanel.determinism ? '✓' : '✗'} · KPI=Σstage ${this.kpiOk ? '✓' : '✗'}`;
+  }
+}
+
+// ---- boot ----
+async function boot() {
+  const lp = new URLSearchParams(location.search).get('layout');
+  if (lp) { try { window.OPD_LAYOUT = await (await fetch(lp)).json(); } catch (e) { console.warn('[layout] failed to load', lp, e); } }
+  const L = window.OPD_LAYOUT || DEFAULT_LAYOUT;
+  if (L !== LAYOUT) Object.assign(LAYOUT, L);
+  window.__app = new App();
+}
+boot();
+</script>
+</body>
+</html>
