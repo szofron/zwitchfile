@@ -132,6 +132,43 @@ main, header, footer { position: relative; z-index: 1; }
     border-color: var(--indigo-soft);
 }
 
+.ghost-btn[aria-pressed="true"] {
+    background: var(--indigo-soft);
+    border-color: var(--indigo-2);
+    color: var(--indigo);
+}
+
+/* ===== Siri-style glow (shown when "Hey Claude" is heard) ===== */
+.siri-glow {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.6s ease;
+}
+.siri-glow.active { opacity: 1; }
+.siri-glow::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    padding: 12px;
+    background: linear-gradient(90deg, #4F46E5, #C026D3, #F59E0B, #10B981, #38BDF8, #4F46E5);
+    background-size: 300% 100%;
+    animation: siri-flow 3s linear infinite;
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
+    filter: blur(10px) saturate(1.4);
+}
+@keyframes siri-flow {
+    from { background-position: 0% 50%; }
+    to   { background-position: 300% 50%; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .siri-glow::before { animation: none; }
+}
+
 .danger-btn {
     background: var(--maroon);
     color: var(--cream-3);

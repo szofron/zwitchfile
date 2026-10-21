@@ -1,4 +1,5 @@
 import { CONVERSION_MATRIX, convertFile, buildPreviewElement } from "./converters.js";
+import { initWakeWord } from "./voice.js";
 
 // ----- DOM handles ---------------------------------------------------------
 const dropZone   = document.getElementById("drop-zone");
@@ -336,4 +337,9 @@ aboutBtn.addEventListener("click", () => {
             <br>ไม่มีการอัปโหลดไปยังเซิร์ฟเวอร์ใดๆ
             <br><br>รองรับ: PDF, Word, Excel, CSV, JSON, TXT, HTML, รูปภาพ`,
     });
+});
+
+initWakeWord({
+    button: document.getElementById("wake-btn"),
+    glow: document.getElementById("siri-glow"),
 });
